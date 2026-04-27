@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Voice call service using Telethon + py-tgcalls 2.x.
-Communicates with Node.js bot via stdin/stdout JSON messages.
+Voice call service — Telethon + py-tgcalls 2.x
+Communicates with Node.js via stdin/stdout JSON messages.
 """
 
 import asyncio
@@ -12,24 +12,19 @@ import traceback
 import logging
 from pathlib import Path
 
-# Enable full debug logging so we can see exactly what pytgcalls/ntgcalls does
-logging.basicConfig(level=logging.DEBUG, stream=sys.stderr,
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr,
                     format='%(name)s %(levelname)s %(message)s')
-# Quiet down noisy loggers we don't care about
-for quiet in ('telethon', 'asyncio', 'urllib3', 'httpx'):
-    logging.getLogger(quiet).setLevel(logging.WARNING)
 
 API_ID   = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
-# Debug: log session string status at startup  
-import sys as _sys
-_sys.stderr.write(f"[VS_STARTUP] SESSION_STRING set: {bool(SESSION_STRING)}, len={len(SESSION_STRING)}\n")
-_sys.stderr.flush()
-
 tl_client = None
 calls     = None
+
+# Per-chat state
+volume_state: dict = {}   # chat_id -> 0-200 (100 = normal)
+repeat_state: dict = {}   # chat_id -> (file_path, remaining)
 
 def send(msg: dict):
     print(json.dumps(msg), flush=True)
@@ -39,104 +34,85 @@ def log(msg: str):
     sys.stderr.flush()
 
 # ---------------------------------------------------------------------------
-# Patch pytgcalls to log transport params from Telegram
+# Helpers
 # ---------------------------------------------------------------------------
 
-def patch_pytgcalls_logging():
-    """Monkey-patch the connect call to log what Telegram actually returns."""
+async def _get_group_call(chat_id: int):
+    """Return the active InputGroupCall for chat_id, or None."""
+    from telethon.tl import functions
+    from telethon.tl.types import InputPeerChannel, InputPeerChat, InputChannel
     try:
-        from pytgcalls.mtproto import MtProtoClient
-
-        original_join = MtProtoClient.join_group_call.__wrapped__ if hasattr(
-            MtProtoClient.join_group_call, '__wrapped__') else None
-
-        orig_call = MtProtoClient.join_group_call
-
-        async def patched_join(self, chat_id, json_join, invite_hash, video_stopped, join_as):
-            result = await orig_call(self, chat_id, json_join, invite_hash, video_stopped, join_as)
-            try:
-                parsed = json.loads(result)
-                transport = parsed.get('transport', {})
-                if transport:
-                    candidates = transport.get('candidates', [])
-                    log(f"[PATCH] Transport from Telegram: "
-                        f"ufrag={transport.get('ufrag','?')} "
-                        f"candidates={len(candidates)} "
-                        f"types={list(set(c.get('type','?') for c in candidates))} "
-                        f"protocols={list(set(c.get('protocol','?') for c in candidates))}")
-                    for c in candidates[:5]:
-                        log(f"  candidate: type={c.get('type')} proto={c.get('protocol')} "
-                            f"ip={c.get('ip')} port={c.get('port')}")
-                else:
-                    log(f"[PATCH] Transport is NULL/empty from Telegram! result={result[:200]}")
-            except Exception as pe:
-                log(f"[PATCH] Could not parse result: {pe}")
-            return result
-
-        MtProtoClient.join_group_call = patched_join
-        log("[PATCH] pytgcalls transport logging installed")
+        peer = await tl_client.get_input_entity(chat_id)
+        if isinstance(peer, InputPeerChannel):
+            full = await tl_client(functions.channels.GetFullChannelRequest(
+                channel=InputChannel(peer.channel_id, peer.access_hash)
+            ))
+            return full.full_chat.call
+        elif isinstance(peer, InputPeerChat):
+            full = await tl_client(functions.messages.GetFullChatRequest(
+                chat_id=abs(chat_id)
+            ))
+            return full.full_chat.call
     except Exception as e:
-        log(f"[PATCH] Could not patch pytgcalls: {e}")
+        log(f"[_get_group_call] {e}")
+    return None
 
 # ---------------------------------------------------------------------------
-# PyTgCalls management
+# PyTgCalls init
 # ---------------------------------------------------------------------------
 
 async def get_calls():
-    """Return (and lazy-init) the PyTgCalls instance."""
     global calls, tl_client
     if calls is None:
         if tl_client is None:
             raise RuntimeError("No active user session — use /qr to log in")
-        patch_pytgcalls_logging()
         from pytgcalls import PyTgCalls
         calls = PyTgCalls(tl_client)
+
+        @calls.on_stream_end()
+        async def on_stream_end(client, *args):
+            try:
+                update = args[0] if args else None
+                if update is None:
+                    return
+                chat_id = getattr(update, 'chat_id', None)
+                if chat_id is None:
+                    try:
+                        chat_id = int(update)
+                    except Exception:
+                        return
+                await _handle_stream_end(chat_id)
+            except Exception as e:
+                log(f"[stream_end handler] {e}")
+
         await calls.start()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         log("[calls] PyTgCalls started")
     return calls
 
-# ---------------------------------------------------------------------------
-# Entity / group-call pre-check
-# ---------------------------------------------------------------------------
 
-async def prefetch_group_call(chat_id: int):
-    """
-    Pre-load the entity and verify the group call is accessible.
-    Returns the InputGroupCall or None.
-    """
-    global tl_client
-    try:
-        from telethon.tl import functions
-        from telethon.tl.types import InputPeerChannel, InputPeerChat
-
-        # Step 1: resolve entity (caches access_hash in Telethon session)
-        entity = await tl_client.get_entity(chat_id)
-        log(f"[prefetch] entity={entity.__class__.__name__} id={entity.id}")
-
-        # Step 2: get full chat to check for active group call
-        peer = await tl_client.get_input_entity(chat_id)
-        if isinstance(peer, InputPeerChannel):
-            from telethon.tl.types import InputChannel
-            full = await tl_client(functions.channels.GetFullChannelRequest(
-                channel=InputChannel(peer.channel_id, peer.access_hash)
-            ))
-            call = full.full_chat.call
-        elif isinstance(peer, InputPeerChat):
-            full = await tl_client(functions.messages.GetFullChatRequest(chat_id=abs(chat_id)))
-            call = full.full_chat.call
-        else:
-            call = None
-
-        if call is None:
-            log(f"[prefetch] No active voice chat in this group!")
-            return None
-        else:
-            log(f"[prefetch] Active group call found: id={call.id} access_hash={call.access_hash}")
-            return call
-    except Exception as e:
-        log(f"[prefetch] Failed: {traceback.format_exc()}")
-        return None
+async def _handle_stream_end(chat_id: int):
+    """Handle stream end: repeat if requested, else notify bot."""
+    if chat_id in repeat_state:
+        file_path, remaining = repeat_state[chat_id]
+        if remaining > 0 and Path(file_path).exists():
+            repeat_state[chat_id] = (file_path, remaining - 1)
+            try:
+                from pytgcalls.types import MediaStream, AudioQuality
+                tgc = await get_calls()
+                stream = MediaStream(
+                    file_path,
+                    audio_parameters=AudioQuality.HIGH,
+                    video_flags=MediaStream.Flags.IGNORE,
+                )
+                await tgc.play(chat_id, stream)
+                send({"ok": True, "event": "repeat_playing",
+                      "chat_id": chat_id, "remaining": remaining - 1})
+                return
+            except Exception as e:
+                log(f"[repeat] play error: {e}")
+        del repeat_state[chat_id]
+    send({"ok": True, "event": "stream_ended", "chat_id": chat_id})
 
 # ---------------------------------------------------------------------------
 # QR login
@@ -184,7 +160,8 @@ async def _wait_telethon_qr(tl, qr):
             "session_string": session_str,
         })
     except asyncio.TimeoutError:
-        send({"ok": False, "event": "qr_timeout", "error": "QR code expired (120s). Use /qr again."})
+        send({"ok": False, "event": "qr_timeout",
+              "error": "QR code expired (120s). Use /qr again."})
         try:
             await tl.disconnect()
         except Exception:
@@ -193,7 +170,7 @@ async def _wait_telethon_qr(tl, qr):
         name = type(e).__name__
         if "SessionPasswordNeeded" in name or "2FA" in str(e):
             send({"ok": False, "event": "qr_error",
-                  "error": "الحساب محمي بكلمة مرور (2FA). يرجى تعطيل 2FA مؤقتاً ثم إعادة المحاولة."})
+                  "error": "الحساب محمي بكلمة مرور (2FA). يرجى تعطيل 2FA مؤقتاً."})
         else:
             log(f"[qr] wait error: {traceback.format_exc()}")
             send({"ok": False, "event": "qr_error", "error": str(e)})
@@ -218,6 +195,43 @@ async def cmd_check_session():
         send({"ok": False, "event": "session_invalid", "error": str(e)})
 
 # ---------------------------------------------------------------------------
+# Check participant
+# ---------------------------------------------------------------------------
+
+async def cmd_check_participant(chat_id: int, user_id: int):
+    """Check if user_id is currently in the voice call of chat_id."""
+    try:
+        if tl_client is None or not tl_client.is_connected():
+            send({"ok": True, "in_call": True, "reason": "no_session"})
+            return
+
+        from telethon.tl import functions
+        from telethon.tl.types import InputGroupCall
+
+        call_obj = await _get_group_call(chat_id)
+        if call_obj is None:
+            send({"ok": False, "in_call": False, "reason": "no_active_call"})
+            return
+
+        result = await tl_client(functions.phone.GetGroupParticipantsRequest(
+            call=InputGroupCall(id=call_obj.id, access_hash=call_obj.access_hash),
+            ids=[],
+            sources=[],
+            offset="",
+            limit=500,
+        ))
+
+        in_call = any(
+            getattr(p.peer, 'user_id', None) == user_id
+            for p in result.participants
+        )
+        send({"ok": True, "in_call": in_call})
+
+    except Exception as e:
+        log(f"[check_participant] {e}")
+        send({"ok": True, "in_call": True, "reason": "check_error"})
+
+# ---------------------------------------------------------------------------
 # Voice call commands
 # ---------------------------------------------------------------------------
 
@@ -226,16 +240,16 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
         from pytgcalls.types import MediaStream, AudioQuality
 
         if not Path(audio_file).exists():
-            send({"ok": False, "error": f"Audio file not found: {audio_file}", "chat_id": chat_id})
+            send({"ok": False, "error": f"Audio file not found: {audio_file}",
+                  "chat_id": chat_id})
             return
 
-        log(f"[play] starting for chat_id={chat_id}, file={audio_file}")
+        log(f"[play] chat_id={chat_id} file={audio_file}")
 
-        # Pre-check: ensure entity is cached and group call exists
-        call_info = await prefetch_group_call(chat_id)
+        call_info = await _get_group_call(chat_id)
         if call_info is None:
             send({"ok": False,
-                  "error": "لا يوجد مكالمة صوتية نشطة في المجموعة أو تعذّر الوصول إليها",
+                  "error": "لا يوجد مكالمة صوتية نشطة في المجموعة",
                   "chat_id": chat_id})
             return
 
@@ -246,15 +260,19 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
         )
-
-        log(f"[play] calling tgc.play({chat_id})")
         await tgc.play(chat_id, stream)
+
+        vol = volume_state.get(chat_id, 100)
+        try:
+            await tgc.change_volume_call(chat_id, vol)
+        except Exception:
+            pass
+
         send({"ok": True, "event": "playing", "chat_id": chat_id})
-        log(f"[play] started successfully for {chat_id}")
+        log(f"[play] started for {chat_id}")
 
     except Exception as e:
-        tb = traceback.format_exc()
-        log(f"[play] error:\n{tb}")
+        log(f"[play] error: {traceback.format_exc()}")
         send({"ok": False, "error": repr(e), "chat_id": chat_id})
 
 
@@ -262,33 +280,40 @@ async def cmd_stop(chat_id: int):
     try:
         tgc = await get_calls()
         await tgc.leave_call(chat_id)
+        repeat_state.pop(chat_id, None)
         send({"ok": True, "event": "stopped", "chat_id": chat_id})
     except Exception as e:
-        log(f"[stop] error: {traceback.format_exc()}")
+        log(f"[stop] error: {e}")
         send({"ok": False, "error": str(e)})
 
 
-async def cmd_skip(chat_id: int, audio_file: str):
+async def cmd_set_volume(chat_id: int, volume: int):
     try:
-        from pytgcalls.types import MediaStream, AudioQuality
+        volume = max(0, min(200, volume))
+        volume_state[chat_id] = volume
         tgc = await get_calls()
-        stream = MediaStream(
-            audio_file,
-            audio_parameters=AudioQuality.HIGH,
-            video_flags=MediaStream.Flags.IGNORE,
-        )
-        await tgc.play(chat_id, stream)
-        send({"ok": True, "event": "skipped", "chat_id": chat_id})
+        await tgc.change_volume_call(chat_id, volume)
+        send({"ok": True, "event": "volume_set", "volume": volume, "chat_id": chat_id})
     except Exception as e:
-        log(f"[skip] error: {traceback.format_exc()}")
-        send({"ok": False, "error": str(e)})
+        log(f"[volume] error: {e}")
+        send({"ok": False, "error": str(e), "chat_id": chat_id})
+
+
+async def cmd_set_repeat(chat_id: int, audio_file: str, count: int):
+    try:
+        if count > 0:
+            repeat_state[chat_id] = (audio_file, count - 1)
+        else:
+            repeat_state.pop(chat_id, None)
+        send({"ok": True, "event": "repeat_set", "count": count, "chat_id": chat_id})
+    except Exception as e:
+        send({"ok": False, "error": str(e), "chat_id": chat_id})
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Session background restore
 # ---------------------------------------------------------------------------
 
 async def _init_session_bg():
-    """Background task: restore saved Telethon session without blocking the command loop."""
     global tl_client
     if not SESSION_STRING:
         return
@@ -297,7 +322,7 @@ async def _init_session_bg():
         from telethon.sessions import StringSession
         tl = TelegramClient(
             StringSession(SESSION_STRING), API_ID, API_HASH,
-            connection_retries=1, retry_delay=2, timeout=15,
+            connection_retries=2, retry_delay=3, timeout=20,
         )
         log("[session] connecting with saved session…")
         await tl.connect()
@@ -309,21 +334,21 @@ async def _init_session_bg():
         tl_client = tl
         log(f"[session] restored: {me.first_name}")
         send({"ok": True, "event": "session_activated",
-              "name": me.first_name or "", "phone": getattr(me, "phone", "") or ""})
+              "name": me.first_name or "",
+              "phone": getattr(me, "phone", "") or ""})
     except Exception as e:
         log(f"[session] restore error: {e}")
 
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 async def main():
-    global tl_client, calls
-
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    # Send ready immediately so commands can be processed right away.
-    # Saved session restores in background — fires session_activated when done.
     send({"ok": True, "event": "ready", "session_active": False})
     if SESSION_STRING:
         asyncio.create_task(_init_session_bg())
@@ -340,18 +365,31 @@ async def main():
                 await cmd_qr_login()
             elif cmd == "check_session":
                 await cmd_check_session()
+            elif cmd == "check_participant":
+                asyncio.create_task(
+                    cmd_check_participant(data["chat_id"], data["user_id"])
+                )
             elif cmd == "join_and_play":
-                asyncio.create_task(cmd_join_and_play(data["chat_id"], data["audio_file"]))
+                asyncio.create_task(
+                    cmd_join_and_play(data["chat_id"], data["audio_file"])
+                )
             elif cmd == "stop":
                 asyncio.create_task(cmd_stop(data["chat_id"]))
-            elif cmd == "skip":
-                asyncio.create_task(cmd_skip(data["chat_id"], data["audio_file"]))
+            elif cmd == "set_volume":
+                asyncio.create_task(
+                    cmd_set_volume(data["chat_id"], data["volume"])
+                )
+            elif cmd == "set_repeat":
+                asyncio.create_task(
+                    cmd_set_repeat(data["chat_id"], data["audio_file"], data["count"])
+                )
             else:
                 send({"ok": False, "error": f"Unknown command: {cmd}"})
+
         except json.JSONDecodeError:
             pass
         except Exception as e:
-            log(f"[main loop] error: {traceback.format_exc()}")
+            log(f"[main loop] {traceback.format_exc()}")
             send({"ok": False, "error": str(e)})
 
 

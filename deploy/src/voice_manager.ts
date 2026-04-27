@@ -10,6 +10,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 type VoiceMsg = { ok: boolean; event?: string; error?: string; [key: string]: unknown };
 type PendingResolve = (msg: VoiceMsg) => void;
 
+// Async/unsolicited events — must not consume a pending resolver
+const ASYNC_EVENTS = new Set([
+  "ready", "session_activated",
+  "stream_ended", "repeat_playing",
+  "qr_logged_in", "qr_timeout", "qr_error",
+]);
+
 class VoiceManager extends EventEmitter {
   private proc: ChildProcess | null = null;
   private buffer = "";
@@ -17,20 +24,17 @@ class VoiceManager extends EventEmitter {
   private ready = false;
 
   start() {
-    // .venv lives one level up from dist/
     const venvDir = join(__dirname, "..", ".venv");
     const python = existsSync(join(venvDir, "bin", "python3"))
       ? join(venvDir, "bin", "python3")
       : "python3";
 
     const scriptPath = join(__dirname, "voice_service.py");
-
     if (!existsSync(scriptPath)) {
       logger.error("voice_service.py not found");
       return;
     }
 
-    // Ensure libstdc++ is in library path for ntgcalls native bindings
     let libPath = "";
     try {
       const p = execFileSync("gcc", ["--print-file-name=libstdc++.so.6"]).toString().trim();
@@ -57,20 +61,23 @@ class VoiceManager extends EventEmitter {
         try {
           const msg: VoiceMsg = JSON.parse(line);
           logger.info(`VoiceService msg: ${JSON.stringify(msg)}`);
+
           if (msg.event === "ready") {
             this.ready = true;
             this.emit("ready");
           } else if (msg.event === "session_activated") {
             logger.info(`VoiceService session activated: ${msg.name || ""}`);
             this.emit("session_activated", msg);
+          } else if (ASYNC_EVENTS.has(msg.event ?? "")) {
+            // Unsolicited events bypass the resolver queue
+            this.emit(msg.event as string, msg);
           } else {
+            // Solicited response — give to next pending resolver
             const resolver = this.pendingResolvers.shift();
             if (resolver) resolver(msg);
             else this.emit("message", msg);
           }
-        } catch {
-          // ignore parse errors
-        }
+        } catch { /* ignore parse errors */ }
       }
     });
 
@@ -87,9 +94,7 @@ class VoiceManager extends EventEmitter {
   }
 
   private send(cmd: object) {
-    if (!this.proc?.stdin) {
-      throw new Error("VoiceService not running");
-    }
+    if (!this.proc?.stdin) throw new Error("VoiceService not running");
     this.proc.stdin.write(JSON.stringify(cmd) + "\n");
   }
 
@@ -102,16 +107,27 @@ class VoiceManager extends EventEmitter {
 
   isReady() { return this.ready; }
 
-  /** Start QR login — resolves with { ok, url } when QR is ready to display.
-   *  Later emits "message" event with event="qr_logged_in" | "qr_timeout" | "qr_error". */
-  qrLogin() { return this.request({ cmd: "qr_login" }); }
-  checkSession() { return this.request({ cmd: "check_session" }); }
+  qrLogin()          { return this.request({ cmd: "qr_login" }); }
+  checkSession()     { return this.request({ cmd: "check_session" }); }
+
+  checkParticipant(chatId: number, userId: number) {
+    return this.request({ cmd: "check_participant", chat_id: chatId, user_id: userId });
+  }
+
   joinAndPlay(chatId: number, audioFile: string) {
     return this.request({ cmd: "join_and_play", chat_id: chatId, audio_file: audioFile });
   }
-  stop(chatId: number) { return this.request({ cmd: "stop", chat_id: chatId }); }
-  skip(chatId: number, audioFile: string) {
-    return this.request({ cmd: "skip", chat_id: chatId, audio_file: audioFile });
+
+  stop(chatId: number) {
+    return this.request({ cmd: "stop", chat_id: chatId });
+  }
+
+  setVolume(chatId: number, volume: number) {
+    return this.request({ cmd: "set_volume", chat_id: chatId, volume });
+  }
+
+  setRepeat(chatId: number, audioFile: string, count: number) {
+    return this.request({ cmd: "set_repeat", chat_id: chatId, audio_file: audioFile, count });
   }
 }
 
