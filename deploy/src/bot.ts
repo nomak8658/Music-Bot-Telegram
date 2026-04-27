@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { logger } from "./lib/logger";
 import { voiceManager } from "./voice_manager";
+import { YT_COOKIES_FILE } from "./app";
 
 const execFileAsync = promisify(execFile);
 
@@ -141,11 +142,16 @@ async function editNowPlaying(
 
 type VideoResult = { id: string; title: string; duration: string; uploader: string };
 
+function ytCookiesArgs(): string[] {
+  return existsSync(YT_COOKIES_FILE) ? ["--cookies", YT_COOKIES_FILE] : [];
+}
+
 async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   const { stdout } = await execFileAsync("yt-dlp", [
     `ytsearch${limit}:${query}`,
     "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(uploader)s",
-    "--no-download", "--no-playlist", "--socket-timeout", "15", "--quiet",
+    "--no-download", "--no-playlist", "--socket-timeout", "20", "--quiet",
+    ...ytCookiesArgs(),
   ]);
   return stdout.trim().split("\n")
     .filter(l => l.includes("|||"))
@@ -161,6 +167,7 @@ async function downloadAudio(videoId: string): Promise<string> {
     `https://www.youtube.com/watch?v=${videoId}`,
     "-x", "--audio-format", "mp3", "--audio-quality", "128K",
     "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
+    ...ytCookiesArgs(),
   ]);
   return outTemplate.replace("%(ext)s", "mp3");
 }
