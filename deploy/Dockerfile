@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-ARG CACHEBUST=2026-04-27-v3
+ARG CACHEBUST=2026-04-27-v4
 
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev \
@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 COPY . .
 RUN node ./build.mjs
