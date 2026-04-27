@@ -287,59 +287,6 @@ async def cmd_skip(chat_id: int, audio_file: str):
 # Main loop
 # ---------------------------------------------------------------------------
 
-def _fix_session_string(sess_str: str) -> str:
-    """Fix malformed session strings (264 bytes instead of expected 263 for IPv4)."""
-    import base64 as _b64, struct as _struct
-    if not sess_str or len(sess_str) < 2:
-        return sess_str
-    b64_part = sess_str[1:]
-    # Telethon expects exactly 352 chars for IPv4
-    if len(b64_part) == 352:
-        return sess_str  # already correct
-    if len(b64_part) == 353:
-        # Extra character in b64 part — strip trailing '=' and re-decode
-        b64_clean = b64_part.rstrip('=')
-        raw = _b64.urlsafe_b64decode(b64_clean + '=' * (-len(b64_clean) % 4))
-        if len(raw) == 264:
-            # Take first 263 bytes (drop extra byte at end)
-            dc, ip_bytes, port, auth_key = _struct.unpack('>B4sH256s', raw[:263])
-            repacked = _struct.pack('>B4sH256s', dc, ip_bytes, port, auth_key)
-            fixed_b64 = _b64.urlsafe_b64encode(repacked).decode()
-            log(f"[session] fixed 264→263 bytes, DC={dc}, b64 {len(b64_part)}→{len(fixed_b64)}")
-            return '1' + fixed_b64
-    return sess_str
-
-
-async def _init_session_bg():
-    """Background task: connect Telethon, then notify via stdout."""
-    global tl_client
-    if not SESSION_STRING:
-        return
-    try:
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
-        sess_str = _fix_session_string(SESSION_STRING)
-        tl = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
-        log("[session] connecting…")
-        await asyncio.wait_for(tl.connect(), timeout=30)
-        log("[session] connected, fetching me…")
-        me = await asyncio.wait_for(tl.get_me(), timeout=20)
-        if me is None:
-            await tl.disconnect()
-            log("[session] get_me() returned None — session invalid")
-            send({"ok": False, "event": "session_invalid", "error": "Session expired or revoked"})
-            return
-        tl_client = tl
-        log(f"[session] ready: {me.first_name}")
-        send({"ok": True, "event": "session_activated", "name": me.first_name or "", "phone": getattr(me, "phone", "") or ""})
-    except asyncio.TimeoutError:
-        log("[session] timeout connecting to Telegram")
-        send({"ok": False, "event": "session_invalid", "error": "Connection timeout — Railway may be blocking MTProto"})
-    except Exception as e:
-        log(f"[session] error: {traceback.format_exc()}")
-        send({"ok": False, "event": "session_invalid", "error": str(e)})
-
-
 async def main():
     global tl_client, calls
 
@@ -348,11 +295,9 @@ async def main():
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    # Send ready immediately so bot.ts can start processing commands.
-    # Session init runs in background — it sends session_activated when done.
+    # Always start ready immediately. Session is restored via cmd_restore_session
+    # triggered by bot.ts after ready, or user does /qr for fresh login.
     send({"ok": True, "event": "ready", "session_active": False})
-    if SESSION_STRING:
-        asyncio.create_task(_init_session_bg())
 
     while True:
         try:
