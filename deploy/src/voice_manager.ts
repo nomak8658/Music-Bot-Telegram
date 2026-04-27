@@ -56,7 +56,7 @@ class VoiceManager extends EventEmitter {
         if (!line.trim()) continue;
         try {
           const msg: VoiceMsg = JSON.parse(line);
-          logger.info({ msg }, "VoiceService msg");
+          logger.info(`VoiceService msg: ${JSON.stringify(msg)}`);
           if (msg.event === "ready") {
             this.ready = true;
             this.emit("ready");
