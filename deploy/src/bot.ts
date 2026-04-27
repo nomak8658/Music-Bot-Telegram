@@ -257,7 +257,7 @@ async function playInCall(
     if (!result.ok) throw new Error((result.error as string) ?? "Unknown error");
 
     const info: PlayInfo = {
-      videoId, title, uploader, filePath,
+      videoId: songUrl, title, uploader, filePath,
       msgId: statusMsgId, isPhoto,
       volume: 100, repeatCount: 0,
     };
