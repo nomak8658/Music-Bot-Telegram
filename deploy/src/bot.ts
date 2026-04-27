@@ -729,7 +729,12 @@ export function startBot() {
       return;
     }
 
-    // No queue → mark done
+    // No queue → leave the call and mark done
+    stoppingChats.add(chatId); // prevent recursive stream_ended from leave_call
+    voiceManager.stop(chatId)
+      .catch(() => {})
+      .finally(() => setTimeout(() => stoppingChats.delete(chatId), 3000));
+
     if (info?.msgId) {
       const cap = `✅ انتهت:\n${info.title}`;
       if (info.isPhoto) {
