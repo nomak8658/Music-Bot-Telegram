@@ -87,9 +87,13 @@ class VoiceManager extends EventEmitter {
     });
 
     this.proc.on("exit", (code) => {
-      logger.warn({ code }, "VoiceService exited");
+      logger.warn({ code }, "VoiceService exited — restarting in 3s");
       this.ready = false;
       this.proc = null;
+      // Drain any pending resolvers with error so callers don't hang
+      for (const r of this.pendingResolvers) r({ ok: false, error: "VoiceService restarted" });
+      this.pendingResolvers = [];
+      setTimeout(() => this.start(), 3000);
     });
   }
 
