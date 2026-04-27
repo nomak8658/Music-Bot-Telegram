@@ -1,0 +1,4 @@
+telethon>=1.36.0
+py-tgcalls>=2.2.11
+yt-dlp>=2024.1.1
+aiohttp>=3.9.0
