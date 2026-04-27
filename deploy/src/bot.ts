@@ -12,12 +12,28 @@ const execFileAsync = promisify(execFile);
 const BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
-// Owner user ID — only this user can use /qr
 const OWNER_ID = parseInt(process.env["OWNER_ID"] || "0");
+
+// ─── Allowed groups whitelist ────────────────────────────────────────────────
+// Only these group chats (+ private chats) can use the bot.
+// Add chat IDs separated by commas in env ALLOWED_GROUPS, or hardcode here.
+const ALLOWED_GROUPS: Set<number> = new Set([
+  -1001556165444,   // @QSWALF
+  -1003883104466,   // تجربة العاب
+  ...(process.env["ALLOWED_GROUPS"] ?? "")
+    .split(",")
+    .map((s) => parseInt(s.trim()))
+    .filter((n) => !isNaN(n) && n !== 0),
+]);
+
+function isAllowedChat(chatId: number, chatType: string): boolean {
+  if (chatType === "private") return true;
+  return ALLOWED_GROUPS.has(chatId);
+}
 
 const bot = new Bot(BOT_TOKEN);
 
-// ─── State ─────────────────────────────────────────────────────────────────
+// ─── State ──────────────────────────────────────────────────────────────────
 
 interface PlayInfo {
   videoId: string;
@@ -25,16 +41,30 @@ interface PlayInfo {
   uploader: string;
   filePath: string;
   msgId?: number;
-  isPhoto: boolean;   // whether status message is a photo or text
-  volume: number;     // 0-200
+  isPhoto: boolean;
+  volume: number;
   repeatCount: number;
 }
 
-const nowPlayingUser = new Map<number, number>();   // chatId -> userId who started
-const nowPlayingInfo = new Map<number, PlayInfo>(); // chatId -> song details
-const pendingQR      = new Map<number, number>();   // userId -> chatId (waiting for scan)
+interface QueueItem {
+  videoId: string;
+  title: string;
+  uploader: string;
+  userId: number;
+  userName: string;
+}
 
-// ─── Permission helpers ─────────────────────────────────────────────────────
+const nowPlayingUser = new Map<number, number>();     // chatId -> userId
+const nowPlayingInfo = new Map<number, PlayInfo>();   // chatId -> song info
+const songQueue      = new Map<number, QueueItem[]>(); // chatId -> queue
+const pendingQR      = new Map<number, number>();     // userId -> chatId
+
+function getQueue(chatId: number): QueueItem[] {
+  if (!songQueue.has(chatId)) songQueue.set(chatId, []);
+  return songQueue.get(chatId)!;
+}
+
+// ─── Permission helpers ──────────────────────────────────────────────────────
 
 async function isGroupAdmin(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
   try {
@@ -46,16 +76,13 @@ async function isGroupAdmin(chatId: number, userId: number, api: Bot["api"]): Pr
 }
 
 async function canStop(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
-  // Owner always can
   if (OWNER_ID > 0 && userId === OWNER_ID) return true;
-  // Whoever started the song
   const startedBy = nowPlayingUser.get(chatId);
   if (!startedBy || userId === startedBy) return true;
-  // Group admins
   return isGroupAdmin(chatId, userId, api);
 }
 
-// ─── Keyboard helpers ───────────────────────────────────────────────────────
+// ─── Keyboard & caption helpers ──────────────────────────────────────────────
 
 function buildNowPlayingKeyboard(chatId: number): InlineKeyboard {
   return new InlineKeyboard()
@@ -69,9 +96,10 @@ function buildNowPlayingKeyboard(chatId: number): InlineKeyboard {
     .text("🔁 ثلاث", `vcrep:${chatId}:3`);
 }
 
-function buildNowPlayingCaption(info: PlayInfo): string {
+function buildNowPlayingCaption(info: PlayInfo, queueLen = 0): string {
   let text = `🎵 *يشغّل الآن في المكالمة*\n\n${info.title}\n👤 ${info.uploader}\n\n🔊 الصوت: ${info.volume}%`;
   if (info.repeatCount > 0) text += `\n🔁 تكرار: ${info.repeatCount} ${info.repeatCount === 1 ? "مرة" : "مرات"}`;
+  if (queueLen > 0) text += `\n📋 بالطابور: ${queueLen} ${queueLen === 1 ? "أغنية" : "أغاني"}`;
   return text;
 }
 
@@ -102,7 +130,7 @@ async function editNowPlaying(
   }
 }
 
-// ─── YouTube helpers ────────────────────────────────────────────────────────
+// ─── YouTube helpers ─────────────────────────────────────────────────────────
 
 type VideoResult = { id: string; title: string; duration: string; uploader: string };
 
@@ -130,7 +158,7 @@ async function downloadAudio(videoId: string): Promise<string> {
   return outTemplate.replace("%(ext)s", "mp3");
 }
 
-// ─── Send audio (يوت/بحث) ─────────────────────────────────────────────────
+// ─── Send audio (يوت/بحث) ────────────────────────────────────────────────────
 
 async function sendAudioFile(
   chatId: number,
@@ -158,7 +186,7 @@ async function sendAudioFile(
   }
 }
 
-// ─── Play in voice call (شغل) ──────────────────────────────────────────────
+// ─── Play in voice call ──────────────────────────────────────────────────────
 
 async function playInCall(
   chatId: number,
@@ -174,7 +202,6 @@ async function playInCall(
   let filePath: string | null = null;
 
   try {
-    // Send thumbnail loading message
     try {
       const ph = await api.sendPhoto(chatId, thumbUrl, {
         caption: `⏳ جارٍ التحميل...\n\n🎵 *${title}*\n👤 ${uploader}`,
@@ -202,8 +229,9 @@ async function playInCall(
     nowPlayingUser.set(chatId, userId);
     nowPlayingInfo.set(chatId, info);
 
+    const qLen = getQueue(chatId).length;
     await editNowPlaying(chatId, statusMsgId!, isPhoto,
-      buildNowPlayingCaption(info), buildNowPlayingKeyboard(chatId), api);
+      buildNowPlayingCaption(info, qLen), buildNowPlayingKeyboard(chatId), api);
 
   } catch (err) {
     logger.error({ err }, "Voice call play failed");
@@ -221,7 +249,7 @@ async function playInCall(
   }
 }
 
-// ─── Stop helper ─────────────────────────────────────────────────────────
+// ─── Stop + play next from queue ─────────────────────────────────────────────
 
 async function stopCall(chatId: number, api: Bot["api"]): Promise<{ ok: boolean; error?: string }> {
   const result = await voiceManager.stop(chatId);
@@ -245,11 +273,33 @@ async function stopCall(chatId: number, api: Bot["api"]): Promise<{ ok: boolean;
         }).catch(() => {});
       }
     }
+    // Play next from queue if any
+    await playNextFromQueue(chatId, api);
   }
   return result;
 }
 
-// ─── Commands ───────────────────────────────────────────────────────────────
+async function playNextFromQueue(chatId: number, api: Bot["api"]) {
+  const queue = getQueue(chatId);
+  if (queue.length === 0) return;
+  const next = queue.shift()!;
+  await api.sendMessage(chatId,
+    `▶️ الآن من الطابور:\n🎵 *${next.title}*\n👤 طلبها: ${next.userName}`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+  await playInCall(chatId, next.videoId, next.title, next.uploader, next.userId, api);
+}
+
+// ─── Whitelist middleware ────────────────────────────────────────────────────
+
+bot.use(async (ctx, next) => {
+  const chatId   = ctx.chat?.id ?? 0;
+  const chatType = ctx.chat?.type ?? "private";
+  if (!isAllowedChat(chatId, chatType)) return; // silently ignore
+  await next();
+});
+
+// ─── Commands ────────────────────────────────────────────────────────────────
 
 bot.command("start", (ctx) =>
   ctx.reply(
@@ -257,22 +307,20 @@ bot.command("start", (ctx) =>
     "🎵 `يوت [أغنية]` — تحميل وإرسال الأغنية\n" +
     "🔍 `بحث [أغنية]` — بحث وعرض نتائج للاختيار\n" +
     "📞 `شغل [أغنية]` — تشغيل في مكالمة المجموعة\n" +
-    "⏹ `وقف` — إيقاف التشغيل (من شغّلها فقط)\n\n" +
+    "⏹ `وقف` — إيقاف التشغيل\n" +
+    "📋 `طابور` — عرض قائمة الانتظار\n\n" +
     "ملاحظة: يجب أن تكون في المكالمة لتشغيل أغنية",
     { parse_mode: "Markdown" },
   ),
 );
 
-// /qr — private chat only, or owner only
+// /qr — PRIVATE CHAT ONLY (no exceptions)
 bot.command("qr", async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  // Restrict: private chat only OR must be owner
-  const isPrivate = ctx.chat.type === "private";
-  const isOwner = OWNER_ID > 0 && userId === OWNER_ID;
-  if (!isPrivate && !isOwner) {
-    return ctx.reply("❌ هذا الأمر متاح في المحادثة الخاصة مع البوت فقط.");
+  if (ctx.chat.type !== "private") {
+    return ctx.reply("❌ هذا الأمر يعمل في المحادثة الخاصة مع البوت فقط.\n\nافتح محادثة خاصة مع البوت وأرسل /qr");
   }
 
   if (!voiceManager.isReady()) {
@@ -317,12 +365,13 @@ bot.command("status", async (ctx) => {
   }
 });
 
-// ─── Text handler ────────────────────────────────────────────────────────────
+// ─── Text handler ─────────────────────────────────────────────────────────────
 
 bot.on("message:text", async (ctx) => {
-  const text = ctx.message.text.trim();
+  const text   = ctx.message.text.trim();
   const chatId = ctx.chat.id;
   const userId = ctx.from?.id ?? 0;
+  const userName = ctx.from?.first_name ?? "مجهول";
 
   // ── يوت ──
   if (text.startsWith("يوت ") || text === "يوت") {
@@ -332,8 +381,7 @@ bot.on("message:text", async (ctx) => {
     try {
       const results = await searchYouTube(query, 1);
       if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
-      const top = results[0];
-      await sendAudioFile(chatId, top.id, top.title, top.uploader, ctx.api);
+      await sendAudioFile(chatId, results[0].id, results[0].title, results[0].uploader, ctx.api);
     } catch (err) {
       logger.error({ err }, "يوت error");
       await ctx.reply("❌ صار خطأ، جرب مرة ثانية.");
@@ -377,7 +425,7 @@ bot.on("message:text", async (ctx) => {
       return ctx.reply("❌ خدمة المكالمات غير متاحة. تأكد من تسجيل الدخول أولاً.");
     }
 
-    // Check that user is in the voice call
+    // Check voice call is active
     const participantCheck = await voiceManager.checkParticipant(chatId, userId);
     if (!participantCheck.ok) {
       return ctx.reply("❌ لا توجد مكالمة صوتية نشطة في هذه المجموعة.");
@@ -386,6 +434,34 @@ bot.on("message:text", async (ctx) => {
       return ctx.reply("❌ يجب أن تكون في المكالمة الصوتية لتشغيل أغنية. انضم أولاً ثم اطلب.");
     }
 
+    // If something is already playing → add to queue
+    if (nowPlayingInfo.has(chatId)) {
+      await ctx.reply(`🔍 أبحث عن: ${query}`);
+      try {
+        const results = await searchYouTube(query, 1);
+        if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
+        const top = results[0];
+        const queue = getQueue(chatId);
+        queue.push({ videoId: top.id, title: top.title, uploader: top.uploader, userId, userName });
+        const pos = queue.length;
+        await ctx.reply(
+          `📋 تمت الإضافة للطابور (#${pos})\n🎵 *${top.title}*\n👤 ${top.uploader}`,
+          { parse_mode: "Markdown" }
+        );
+        // Update now-playing message to show queue count
+        const info = nowPlayingInfo.get(chatId);
+        if (info?.msgId) {
+          await editNowPlaying(chatId, info.msgId, info.isPhoto,
+            buildNowPlayingCaption(info, queue.length), buildNowPlayingKeyboard(chatId), ctx.api);
+        }
+      } catch (err) {
+        logger.error({ err }, "Queue add error");
+        await ctx.reply("❌ صار خطأ.");
+      }
+      return;
+    }
+
+    // Nothing playing → play directly
     await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
       const results = await searchYouTube(query, 1);
@@ -407,15 +483,35 @@ bot.on("message:text", async (ctx) => {
     }
     const result = await stopCall(chatId, ctx.api);
     if (result.ok) {
-      await ctx.reply("⏹ تم إيقاف التشغيل.");
+      const hasNext = getQueue(chatId).length > 0;
+      if (!hasNext) await ctx.reply("⏹ تم إيقاف التشغيل.");
     } else {
       await ctx.reply(`❌ ${result.error}`);
     }
     return;
   }
+
+  // ── طابور ──
+  if (text === "طابور") {
+    const queue = getQueue(chatId);
+    if (queue.length === 0) {
+      const current = nowPlayingInfo.get(chatId);
+      if (current) {
+        return ctx.reply(`🎵 يشتغل الآن: *${current.title}*\n📋 الطابور فاضي`, { parse_mode: "Markdown" });
+      }
+      return ctx.reply("📋 الطابور فاضي ولا يوجد شيء يشتغل.");
+    }
+    const current = nowPlayingInfo.get(chatId);
+    let msg = current ? `🎵 *يشتغل الآن:* ${current.title}\n\n` : "";
+    msg += `📋 *الطابور (${queue.length}):*\n`;
+    queue.forEach((item, i) => {
+      msg += `${i + 1}. ${item.title} — طلبها ${item.userName}\n`;
+    });
+    return ctx.reply(msg, { parse_mode: "Markdown" });
+  }
 });
 
-// ─── Callback: Download ────────────────────────────────────────────────────
+// ─── Callback: Download ───────────────────────────────────────────────────────
 
 bot.callbackQuery(/^dl:([^:]+):([^:]+):(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery({ text: "⏳ جارٍ التحميل..." });
@@ -425,7 +521,7 @@ bot.callbackQuery(/^dl:([^:]+):([^:]+):(.+)$/, async (ctx) => {
   await sendAudioFile(chatId, videoId, title, uploader, ctx.api);
 });
 
-// ─── Callback: Stop voice call ─────────────────────────────────────────────
+// ─── Callback: Stop voice call ────────────────────────────────────────────────
 
 bot.callbackQuery(/^vcstop:(-?\d+)$/, async (ctx) => {
   const chatId = parseInt(ctx.match[1]);
@@ -439,13 +535,10 @@ bot.callbackQuery(/^vcstop:(-?\d+)$/, async (ctx) => {
   }
 
   await ctx.answerCallbackQuery({ text: "⏹ جارٍ الإيقاف..." });
-  const result = await stopCall(chatId, ctx.api);
-  if (!result.ok) {
-    await ctx.answerCallbackQuery({ text: `❌ ${result.error}`, show_alert: true });
-  }
+  await stopCall(chatId, ctx.api);
 });
 
-// ─── Callback: Volume ──────────────────────────────────────────────────────
+// ─── Callback: Volume ─────────────────────────────────────────────────────────
 
 bot.callbackQuery(/^vcvol:(-?\d+):([+-]?\d+)$/, async (ctx) => {
   const chatId = parseInt(ctx.match[1]);
@@ -464,14 +557,14 @@ bot.callbackQuery(/^vcvol:(-?\d+):([+-]?\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery({ text: `🔊 الصوت: ${info.volume}%` });
     if (info.msgId) {
       await editNowPlaying(chatId, info.msgId, info.isPhoto,
-        buildNowPlayingCaption(info), buildNowPlayingKeyboard(chatId), ctx.api);
+        buildNowPlayingCaption(info, getQueue(chatId).length), buildNowPlayingKeyboard(chatId), ctx.api);
     }
   } else {
     await ctx.answerCallbackQuery({ text: `❌ ${result.error}`, show_alert: true });
   }
 });
 
-// ─── Callback: Repeat ─────────────────────────────────────────────────────
+// ─── Callback: Repeat ─────────────────────────────────────────────────────────
 
 bot.callbackQuery(/^vcrep:(-?\d+):(\d+)$/, async (ctx) => {
   const chatId = parseInt(ctx.match[1]);
@@ -490,14 +583,14 @@ bot.callbackQuery(/^vcrep:(-?\d+):(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery({ text: `🔁 سيتكرر ${label} بعد انتهائها` });
     if (info.msgId) {
       await editNowPlaying(chatId, info.msgId, info.isPhoto,
-        buildNowPlayingCaption(info), buildNowPlayingKeyboard(chatId), ctx.api);
+        buildNowPlayingCaption(info, getQueue(chatId).length), buildNowPlayingKeyboard(chatId), ctx.api);
     }
   } else {
     await ctx.answerCallbackQuery({ text: `❌ ${result.error}`, show_alert: true });
   }
 });
 
-// ─── Bot startup ──────────────────────────────────────────────────────────
+// ─── Bot startup ──────────────────────────────────────────────────────────────
 
 export function startBot() {
   voiceManager.start();
@@ -511,23 +604,43 @@ export function startBot() {
     logger.info({ name: msg.name }, "User session activated");
   });
 
-  // Stream ended — clean up state and update message
+  // Stream ended → play next from queue, or mark as done
   voiceManager.on("stream_ended", async (msg: { chat_id?: number }) => {
     const chatId = msg.chat_id;
     if (!chatId) return;
     const info = nowPlayingInfo.get(chatId);
     nowPlayingUser.delete(chatId);
     nowPlayingInfo.delete(chatId);
-    if (!info) return;
-    if (info.filePath && existsSync(info.filePath)) {
+
+    if (info?.filePath && existsSync(info.filePath)) {
       await unlink(info.filePath).catch(() => {});
     }
-    if (info.msgId) {
+
+    // If queue has items, play next
+    const queue = getQueue(chatId);
+    if (queue.length > 0) {
+      if (info?.msgId) {
+        const cap = `✅ انتهت:\n${info.title}`;
+        if (info.isPhoto) {
+          await bot.api.editMessageCaption(chatId, info.msgId, {
+            caption: cap, reply_markup: new InlineKeyboard(),
+          }).catch(() => {});
+        } else {
+          await bot.api.editMessageText(chatId, info.msgId, cap, {
+            reply_markup: new InlineKeyboard(),
+          }).catch(() => {});
+        }
+      }
+      await playNextFromQueue(chatId, bot.api);
+      return;
+    }
+
+    // No queue → just mark done
+    if (info?.msgId) {
       const cap = `✅ انتهت:\n${info.title}`;
       if (info.isPhoto) {
         await bot.api.editMessageCaption(chatId, info.msgId, {
-          caption: cap,
-          reply_markup: new InlineKeyboard(),
+          caption: cap, reply_markup: new InlineKeyboard(),
         }).catch(() => {});
       } else {
         await bot.api.editMessageText(chatId, info.msgId, cap, {
@@ -546,7 +659,7 @@ export function startBot() {
     info.repeatCount = (msg.remaining as number) ?? 0;
     if (info.msgId) {
       await editNowPlaying(chatId, info.msgId, info.isPhoto,
-        buildNowPlayingCaption(info), buildNowPlayingKeyboard(chatId), bot.api);
+        buildNowPlayingCaption(info, getQueue(chatId).length), buildNowPlayingKeyboard(chatId), bot.api);
     }
   });
 
