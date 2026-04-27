@@ -2,6 +2,7 @@
 """
 Voice call service — Telethon + py-tgcalls 2.x
 Communicates with Node.js via stdin/stdout JSON messages.
+Every solicited response MUST echo back req_id so Node.js can match it.
 """
 
 import asyncio
@@ -69,11 +70,9 @@ async def get_calls():
         from pytgcalls import PyTgCalls
         calls = PyTgCalls(tl_client)
 
-        # Log available stream/update-related attrs for debugging
         _attrs = [a for a in dir(calls) if any(k in a.lower() for k in ('stream','update','end','event'))]
         log(f"[calls] available attrs: {_attrs}")
 
-        # Register stream-end handler — API differs by py-tgcalls version
         _registered = False
 
         # Try 1.x / early 2.x style
@@ -114,10 +113,10 @@ async def get_calls():
                 log(f"[calls] on_update v2 failed: {e}")
 
         if not _registered:
-            log("[calls] WARNING: stream_end handler not registered — repeat/cleanup disabled")
+            log("[calls] WARNING: stream_end handler not registered")
 
         await calls.start()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         log("[calls] PyTgCalls started")
     return calls
 
@@ -137,14 +136,13 @@ async def _handle_stream_end(chat_id: int):
             except Exception as e:
                 log(f"[repeat] play error: {e}")
         del repeat_state[chat_id]
-
     send({"ok": True, "event": "stream_ended", "chat_id": chat_id})
 
 # ---------------------------------------------------------------------------
 # QR login
 # ---------------------------------------------------------------------------
 
-async def cmd_qr_login():
+async def cmd_qr_login(req_id: str = ""):
     global tl_client, calls
     try:
         from telethon import TelegramClient
@@ -161,12 +159,12 @@ async def cmd_qr_login():
         tl = TelegramClient(StringSession(), API_ID, API_HASH)
         await tl.connect()
         qr = await tl.qr_login()
-        send({"ok": True, "event": "qr_ready", "url": qr.url})
+        send({"ok": True, "event": "qr_ready", "url": qr.url, "req_id": req_id})
         asyncio.create_task(_wait_telethon_qr(tl, qr))
 
     except Exception as e:
         log(f"[qr] start error: {traceback.format_exc()}")
-        send({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        send({"ok": False, "error": f"{type(e).__name__}: {e}", "req_id": req_id})
 
 
 async def _wait_telethon_qr(tl, qr):
@@ -210,26 +208,27 @@ async def _wait_telethon_qr(tl, qr):
 # Session check
 # ---------------------------------------------------------------------------
 
-async def cmd_check_session():
+async def cmd_check_session(req_id: str = ""):
     try:
         if tl_client is None or not tl_client.is_connected():
             raise RuntimeError("Not logged in")
         me = await tl_client.get_me()
         send({"ok": True, "event": "session_valid",
               "name": me.first_name or "",
-              "phone": getattr(me, "phone", "") or ""})
+              "phone": getattr(me, "phone", "") or "",
+              "req_id": req_id})
     except Exception as e:
-        send({"ok": False, "event": "session_invalid", "error": str(e)})
+        send({"ok": False, "event": "session_invalid", "error": str(e), "req_id": req_id})
 
 # ---------------------------------------------------------------------------
 # Check participant
 # ---------------------------------------------------------------------------
 
-async def cmd_check_participant(chat_id: int, user_id: int):
+async def cmd_check_participant(chat_id: int, user_id: int, req_id: str = ""):
     """Check if user_id is currently in the voice call of chat_id."""
     try:
         if tl_client is None or not tl_client.is_connected():
-            send({"ok": True, "in_call": True, "reason": "no_session"})
+            send({"ok": True, "in_call": True, "reason": "no_session", "req_id": req_id})
             return
 
         from telethon.tl import functions
@@ -237,33 +236,30 @@ async def cmd_check_participant(chat_id: int, user_id: int):
 
         call_obj = await _get_group_call(chat_id)
         if call_obj is None:
-            send({"ok": False, "in_call": False, "reason": "no_active_call"})
+            send({"ok": False, "in_call": False, "reason": "no_active_call", "req_id": req_id})
             return
 
         result = await tl_client(functions.phone.GetGroupParticipantsRequest(
             call=InputGroupCall(id=call_obj.id, access_hash=call_obj.access_hash),
-            ids=[],
-            sources=[],
-            offset="",
-            limit=500,
+            ids=[], sources=[], offset="", limit=500,
         ))
 
         in_call = any(
             getattr(p.peer, 'user_id', None) == user_id
             for p in result.participants
         )
-        send({"ok": True, "in_call": in_call})
+        send({"ok": True, "in_call": in_call, "req_id": req_id})
 
     except Exception as e:
         log(f"[check_participant] {e}")
-        send({"ok": True, "in_call": True, "reason": "check_error"})
+        send({"ok": True, "in_call": True, "reason": "check_error", "req_id": req_id})
 
 # ---------------------------------------------------------------------------
 # Voice call commands
 # ---------------------------------------------------------------------------
 
 async def _do_play(tgc, chat_id: int, audio_file: str):
-    """Actually call tgc.play() — extracted for retry logic."""
+    """Play audio file using pytgcalls."""
     from pytgcalls.types import MediaStream, AudioQuality
     stream = MediaStream(
         audio_file,
@@ -273,12 +269,12 @@ async def _do_play(tgc, chat_id: int, audio_file: str):
     await tgc.play(chat_id, stream)
 
 
-async def cmd_join_and_play(chat_id: int, audio_file: str):
+async def cmd_join_and_play(chat_id: int, audio_file: str, req_id: str = ""):
     global calls
     try:
         if not Path(audio_file).exists():
             send({"ok": False, "error": f"Audio file not found: {audio_file}",
-                  "chat_id": chat_id})
+                  "chat_id": chat_id, "req_id": req_id})
             return
 
         log(f"[play] chat_id={chat_id} file={audio_file}")
@@ -287,7 +283,7 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
         if call_info is None:
             send({"ok": False,
                   "error": "لا يوجد مكالمة صوتية نشطة في المجموعة",
-                  "chat_id": chat_id})
+                  "chat_id": chat_id, "req_id": req_id})
             return
 
         tgc = await get_calls()
@@ -298,7 +294,7 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
             # pytgcalls internal process died — reset and retry once
             log("[play] ProcessLookupError — resetting PyTgCalls and retrying")
             calls = None
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
             tgc = await get_calls()
             await _do_play(tgc, chat_id, audio_file)
 
@@ -308,49 +304,51 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
         except Exception:
             pass
 
-        send({"ok": True, "event": "playing", "chat_id": chat_id})
+        send({"ok": True, "event": "playing", "chat_id": chat_id, "req_id": req_id})
         log(f"[play] started for {chat_id}")
 
     except Exception as e:
         log(f"[play] error: {traceback.format_exc()}")
-        send({"ok": False, "error": repr(e), "chat_id": chat_id})
+        send({"ok": False, "error": repr(e), "chat_id": chat_id, "req_id": req_id})
 
 
-async def cmd_stop(chat_id: int):
+async def cmd_stop(chat_id: int, req_id: str = ""):
     try:
         tgc = await get_calls()
         await tgc.leave_call(chat_id)
         repeat_state.pop(chat_id, None)
-        send({"ok": True, "event": "stopped", "chat_id": chat_id})
+        send({"ok": True, "event": "stopped", "chat_id": chat_id, "req_id": req_id})
     except Exception as e:
         log(f"[stop] error: {e}")
-        send({"ok": False, "error": str(e)})
+        send({"ok": False, "error": str(e), "req_id": req_id})
 
 
-async def cmd_set_volume(chat_id: int, volume: int):
+async def cmd_set_volume(chat_id: int, volume: int, req_id: str = ""):
     try:
         volume = max(0, min(200, volume))
         volume_state[chat_id] = volume
         tgc = await get_calls()
         await tgc.change_volume_call(chat_id, volume)
-        send({"ok": True, "event": "volume_set", "volume": volume, "chat_id": chat_id})
+        send({"ok": True, "event": "volume_set", "volume": volume,
+              "chat_id": chat_id, "req_id": req_id})
     except Exception as e:
         log(f"[volume] error: {e}")
-        send({"ok": False, "error": str(e), "chat_id": chat_id})
+        send({"ok": False, "error": str(e), "req_id": req_id})
 
 
-async def cmd_set_repeat(chat_id: int, audio_file: str, count: int):
+async def cmd_set_repeat(chat_id: int, audio_file: str, count: int, req_id: str = ""):
     try:
         if count > 0:
             repeat_state[chat_id] = (audio_file, count - 1)
         else:
             repeat_state.pop(chat_id, None)
-        send({"ok": True, "event": "repeat_set", "count": count, "chat_id": chat_id})
+        send({"ok": True, "event": "repeat_set", "count": count,
+              "chat_id": chat_id, "req_id": req_id})
     except Exception as e:
-        send({"ok": False, "error": str(e), "chat_id": chat_id})
+        send({"ok": False, "error": str(e), "req_id": req_id})
 
 # ---------------------------------------------------------------------------
-# Session background restore
+# Keepalive + Session restore
 # ---------------------------------------------------------------------------
 
 async def _keepalive_loop():
@@ -367,7 +365,6 @@ async def _keepalive_loop():
                     await tl_client.get_me()
             except Exception as e:
                 log(f"[keepalive] error: {e}")
-                # Try to reconnect
                 try:
                     await tl_client.connect()
                 except Exception:
@@ -423,37 +420,38 @@ async def main():
                 break
             data = json.loads(line.decode().strip())
             cmd = data.get("cmd")
+            req_id = data.get("req_id", "")
 
             if cmd == "qr_login":
-                await cmd_qr_login()
+                # Awaited directly — sends qr_ready synchronously before returning
+                await cmd_qr_login(req_id)
             elif cmd == "check_session":
-                await cmd_check_session()
+                await cmd_check_session(req_id)
             elif cmd == "check_participant":
                 asyncio.create_task(
-                    cmd_check_participant(data["chat_id"], data["user_id"])
+                    cmd_check_participant(data["chat_id"], data["user_id"], req_id)
                 )
             elif cmd == "join_and_play":
                 asyncio.create_task(
-                    cmd_join_and_play(data["chat_id"], data["audio_file"])
+                    cmd_join_and_play(data["chat_id"], data["audio_file"], req_id)
                 )
             elif cmd == "stop":
-                asyncio.create_task(cmd_stop(data["chat_id"]))
+                asyncio.create_task(cmd_stop(data["chat_id"], req_id))
             elif cmd == "set_volume":
                 asyncio.create_task(
-                    cmd_set_volume(data["chat_id"], data["volume"])
+                    cmd_set_volume(data["chat_id"], data["volume"], req_id)
                 )
             elif cmd == "set_repeat":
                 asyncio.create_task(
-                    cmd_set_repeat(data["chat_id"], data["audio_file"], data["count"])
+                    cmd_set_repeat(data["chat_id"], data["audio_file"], data["count"], req_id)
                 )
             else:
-                send({"ok": False, "error": f"Unknown command: {cmd}"})
+                send({"ok": False, "error": f"Unknown command: {cmd}", "req_id": req_id})
 
         except json.JSONDecodeError:
             pass
         except Exception as e:
             log(f"[main loop] {traceback.format_exc()}")
-            send({"ok": False, "error": str(e)})
 
 
 if __name__ == "__main__":
