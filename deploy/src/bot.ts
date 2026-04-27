@@ -395,7 +395,8 @@ bot.on("message:text", async (ctx) => {
       await sendAudioFile(chatId, results[0].id, results[0].title, results[0].uploader, ctx.api);
     } catch (err) {
       logger.error({ err }, "يوت error");
-      await ctx.reply("❌ صار خطأ، جرب مرة ثانية.");
+      const msg = (err as Error).message ?? String(err);
+      await ctx.reply(`❌ صار خطأ:\n${msg.slice(0, 200)}`);
     }
     return;
   }
