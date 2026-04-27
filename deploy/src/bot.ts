@@ -12,7 +12,14 @@ const execFileAsync = promisify(execFile);
 const BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
-const OWNER_ID = parseInt(process.env["OWNER_ID"] || "0");
+// Support multiple owners: OWNER_ID=864463823,7877686969
+const OWNER_IDS: Set<number> = new Set(
+  (process.env["OWNER_ID"] ?? "")
+    .split(",")
+    .map((s) => parseInt(s.trim()))
+    .filter((n) => !isNaN(n) && n > 0)
+);
+const OWNER_ID = OWNER_IDS.size > 0 ? [...OWNER_IDS][0] : 0; // keep compat
 
 // ─── Allowed groups whitelist ────────────────────────────────────────────────
 // Only these group chats (+ private chats) can use the bot.
@@ -76,7 +83,7 @@ async function isGroupAdmin(chatId: number, userId: number, api: Bot["api"]): Pr
 }
 
 async function canStop(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
-  if (OWNER_ID > 0 && userId === OWNER_ID) return true;
+  if (OWNER_IDS.has(userId)) return true;
   const startedBy = nowPlayingUser.get(chatId);
   if (!startedBy || userId === startedBy) return true;
   return isGroupAdmin(chatId, userId, api);
@@ -323,7 +330,7 @@ bot.command("qr", async (ctx) => {
     return ctx.reply("❌ هذا الأمر يعمل في المحادثة الخاصة مع البوت فقط.");
   }
 
-  if (OWNER_ID > 0 && userId !== OWNER_ID) {
+  if (OWNER_IDS.size > 0 && !OWNER_IDS.has(userId)) {
     return ctx.reply("❌ هذا الأمر للمالك فقط.");
   }
 
