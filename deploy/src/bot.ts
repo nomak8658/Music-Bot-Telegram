@@ -286,7 +286,11 @@ export function startBot() {
 
   voiceManager.once("ready", async () => {
     logger.info("VoiceService is ready");
-    logger.warn("No active user session — use /qr to log in");
+    logger.warn("No active user session yet — restoring or use /qr to log in");
+  });
+
+  voiceManager.on("session_activated", (msg: { name?: string; phone?: string }) => {
+    logger.info({ name: msg.name }, "User session activated");
   });
 
   // Handle async QR events (fired after user scans or timeout)
