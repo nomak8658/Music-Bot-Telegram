@@ -28,11 +28,9 @@ const OWNER_IDS: Set<number> = new Set(
     .map((s) => parseInt(s.trim()))
     .filter((n) => !isNaN(n) && n > 0)
 );
-const OWNER_ID = OWNER_IDS.size > 0 ? [...OWNER_IDS][0] : 0; // keep compat
+const OWNER_ID = OWNER_IDS.size > 0 ? [...OWNER_IDS][0] : 0;
 
-// ─── Allowed groups whitelist ────────────────────────────────────────────────
-// Only these group chats (+ private chats) can use the bot.
-// Add chat IDs separated by commas in env ALLOWED_GROUPS, or hardcode here.
+// ─── Allowed groups whitelist ─────────────────────────────────────────────────
 const ALLOWED_GROUPS: Set<number> = new Set([
   -1001556165444,   // @QSWALF
   -1003883104466,   // تجربة العاب
@@ -49,7 +47,7 @@ function isAllowedChat(chatId: number, chatType: string): boolean {
 
 const bot = new Bot(BOT_TOKEN);
 
-// ─── State ──────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 
 interface PlayInfo {
   videoId: string;
@@ -63,7 +61,7 @@ interface PlayInfo {
 }
 
 interface QueueItem {
-  videoId: string;   // now stores full SoundCloud URL
+  videoId: string;   // full SoundCloud URL
   title: string;
   uploader: string;
   userId: number;
@@ -71,17 +69,21 @@ interface QueueItem {
   thumbUrl?: string;
 }
 
-const nowPlayingUser = new Map<number, number>();     // chatId -> userId
-const nowPlayingInfo = new Map<number, PlayInfo>();   // chatId -> song info
-const songQueue      = new Map<number, QueueItem[]>(); // chatId -> queue
-const pendingQR      = new Map<number, number>();     // userId -> chatId
+const nowPlayingUser = new Map<number, number>();      // chatId → userId
+const nowPlayingInfo = new Map<number, PlayInfo>();    // chatId → song info
+const songQueue      = new Map<number, QueueItem[]>(); // chatId → queue
+const pendingQR      = new Map<number, number>();      // userId → chatId
+
+// Tracks chats being explicitly stopped — prevents stream_ended from
+// triggering queue play during a manual stop.
+const stoppingChats = new Set<number>();
 
 function getQueue(chatId: number): QueueItem[] {
   if (!songQueue.has(chatId)) songQueue.set(chatId, []);
   return songQueue.get(chatId)!;
 }
 
-// ─── Permission helpers ──────────────────────────────────────────────────────
+// ─── Permission helpers ───────────────────────────────────────────────────────
 
 async function isGroupAdmin(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
   try {
@@ -99,7 +101,7 @@ async function canStop(chatId: number, userId: number, api: Bot["api"]): Promise
   return isGroupAdmin(chatId, userId, api);
 }
 
-// ─── Keyboard & caption helpers ──────────────────────────────────────────────
+// ─── Keyboard & caption helpers ───────────────────────────────────────────────
 
 function buildNowPlayingKeyboard(chatId: number): InlineKeyboard {
   return new InlineKeyboard()
@@ -180,13 +182,15 @@ async function downloadAudio(songUrl: string): Promise<string> {
   const outTemplate = `${tmpdir()}/tg_audio_${Date.now()}.%(ext)s`;
   await execFileAsync("yt-dlp", [
     songUrl,
-    "-x", "--audio-format", "mp3", "--audio-quality", "128K",
-    // Normalize to CBR 128k, 48kHz stereo — prevents stuttering in voice calls
-    "--postprocessor-args", "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0",
+    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+    // CBR 128k, 48kHz stereo + audio normalization → prevents stuttering
+    "--postprocessor-args",
+    "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0 -af dynaudnorm=f=150:g=15",
     "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
     ...ytCookiesArgs(),
-  ]);
-  return outTemplate.replace("%(ext)s", "mp3");
+  ], { maxBuffer: 100 * 1024 * 1024 }); // 100MB buffer
+  const outPath = outTemplate.replace("%(ext)s", "mp3");
+  return outPath;
 }
 
 // ─── Send audio (يوت/بحث) ────────────────────────────────────────────────────
@@ -213,11 +217,12 @@ async function sendAudioFile(
   } catch (err) {
     logger.error({ err, songUrl }, "Download/send failed");
     await api.editMessageText(chatId, statusMsg.message_id, "❌ فشل التحميل، جرب أغنية ثانية.").catch(() => {});
+  } finally {
     if (filePath && existsSync(filePath)) await unlink(filePath).catch(() => {});
   }
 }
 
-// ─── Play in voice call ──────────────────────────────────────────────────────
+// ─── Play in voice call ───────────────────────────────────────────────────────
 
 async function playInCall(
   chatId: number,
@@ -286,34 +291,48 @@ async function playInCall(
   }
 }
 
-// ─── Stop + play next from queue ─────────────────────────────────────────────
+// ─── Stop ─────────────────────────────────────────────────────────────────────
+// NOTE: stoppingChats guards against stream_ended firing during manual stop
+// and triggering queue play.  The queue is cleared on explicit stop so the
+// user gets a clean "stop everything" behaviour.
 
 async function stopCall(chatId: number, api: Bot["api"]): Promise<{ ok: boolean; error?: string }> {
-  const result = await voiceManager.stop(chatId);
-  if (result.ok) {
-    const info = nowPlayingInfo.get(chatId);
-    nowPlayingUser.delete(chatId);
-    nowPlayingInfo.delete(chatId);
-    if (info?.filePath && existsSync(info.filePath)) {
-      await unlink(info.filePath).catch(() => {});
-    }
-    if (info?.msgId) {
-      const stopCap = `⏹ توقّف:\n${info.title}`;
-      if (info.isPhoto) {
-        await api.editMessageCaption(chatId, info.msgId, {
-          caption: stopCap,
-          reply_markup: new InlineKeyboard(),
-        }).catch(() => {});
-      } else {
-        await api.editMessageText(chatId, info.msgId, stopCap, {
-          reply_markup: new InlineKeyboard(),
-        }).catch(() => {});
+  stoppingChats.add(chatId);
+  try {
+    const result = await voiceManager.stop(chatId);
+    if (result.ok) {
+      const info = nowPlayingInfo.get(chatId);
+      nowPlayingUser.delete(chatId);
+      nowPlayingInfo.delete(chatId);
+      // Clear the queue — explicit stop means "stop everything"
+      getQueue(chatId).length = 0;
+
+      // Delete the audio file
+      if (info?.filePath && existsSync(info.filePath)) {
+        await unlink(info.filePath).catch(() => {});
+      }
+
+      // Update message
+      if (info?.msgId) {
+        const stopCap = `⏹ توقّف:\n${info.title}`;
+        if (info.isPhoto) {
+          await api.editMessageCaption(chatId, info.msgId, {
+            caption: stopCap,
+            reply_markup: new InlineKeyboard(),
+          }).catch(() => {});
+        } else {
+          await api.editMessageText(chatId, info.msgId, stopCap, {
+            reply_markup: new InlineKeyboard(),
+          }).catch(() => {});
+        }
       }
     }
-    // Play next from queue if any
-    await playNextFromQueue(chatId, api);
+    return result;
+  } finally {
+    // Small delay so any in-flight stream_ended triggered by leave_call
+    // (which fires before our response) is still blocked by stoppingChats.
+    setTimeout(() => stoppingChats.delete(chatId), 3000);
   }
-  return result;
 }
 
 async function playNextFromQueue(chatId: number, api: Bot["api"]) {
@@ -327,16 +346,16 @@ async function playNextFromQueue(chatId: number, api: Bot["api"]) {
   await playInCall(chatId, next.videoId, next.title, next.uploader, next.userId, api, next.thumbUrl);
 }
 
-// ─── Whitelist middleware ────────────────────────────────────────────────────
+// ─── Whitelist middleware ─────────────────────────────────────────────────────
 
 bot.use(async (ctx, next) => {
   const chatId   = ctx.chat?.id ?? 0;
   const chatType = ctx.chat?.type ?? "private";
-  if (!isAllowedChat(chatId, chatType)) return; // silently ignore
+  if (!isAllowedChat(chatId, chatType)) return;
   await next();
 });
 
-// ─── Commands ────────────────────────────────────────────────────────────────
+// ─── Commands ─────────────────────────────────────────────────────────────────
 
 bot.command("start", (ctx) =>
   ctx.reply(
@@ -344,7 +363,7 @@ bot.command("start", (ctx) =>
     "🎵 `يوت [أغنية]` — تحميل وإرسال الأغنية\n" +
     "🔍 `بحث [أغنية]` — بحث وعرض نتائج للاختيار\n" +
     "📞 `شغل [أغنية]` — تشغيل في مكالمة المجموعة\n" +
-    "⏹ `وقف` — إيقاف التشغيل\n" +
+    "⏹ `وقف` — إيقاف التشغيل وتفريغ الطابور\n" +
     "📋 `طابور` — عرض قائمة الانتظار\n\n" +
     "ملاحظة: يجب أن تكون في المكالمة لتشغيل أغنية",
     { parse_mode: "Markdown" },
@@ -525,8 +544,7 @@ bot.on("message:text", async (ctx) => {
     }
     const result = await stopCall(chatId, ctx.api);
     if (result.ok) {
-      const hasNext = getQueue(chatId).length > 0;
-      if (!hasNext) await ctx.reply("⏹ تم إيقاف التشغيل.");
+      await ctx.reply("⏹ تم إيقاف التشغيل.");
     } else {
       await ctx.reply(`❌ ${result.error}`);
     }
@@ -643,24 +661,30 @@ export function startBot() {
 
   voiceManager.once("ready", () => {
     logger.info("VoiceService is ready");
-    logger.warn("Session restore starting in background...");
   });
 
   voiceManager.on("session_activated", (msg: { name?: string; phone?: string }) => {
     logger.info({ name: msg.name }, "User session activated");
   });
 
-  // Stream ended → play next from queue, or mark as done
+  // Stream ended naturally → play next from queue, or mark as done
   voiceManager.on("stream_ended", async (msg: { chat_id?: number }) => {
     const chatId = msg.chat_id;
     if (!chatId) return;
+
+    // If this chat is being explicitly stopped, ignore the event
+    // (leave_call triggers stream_ended, but we handle cleanup in stopCall)
+    if (stoppingChats.has(chatId)) {
+      logger.info({ chatId }, "stream_ended ignored — manual stop in progress");
+      return;
+    }
+
     const info = nowPlayingInfo.get(chatId);
     nowPlayingUser.delete(chatId);
     nowPlayingInfo.delete(chatId);
 
-    if (info?.filePath && existsSync(info.filePath)) {
-      await unlink(info.filePath).catch(() => {});
-    }
+    // Delete the finished audio file AFTER capturing info (before playing next)
+    const fileToDelete = info?.filePath;
 
     // If queue has items, play next
     const queue = getQueue(chatId);
@@ -677,11 +701,13 @@ export function startBot() {
           }).catch(() => {});
         }
       }
+      // Delete old file before starting next song
+      if (fileToDelete && existsSync(fileToDelete)) await unlink(fileToDelete).catch(() => {});
       await playNextFromQueue(chatId, bot.api);
       return;
     }
 
-    // No queue → just mark done
+    // No queue → mark done
     if (info?.msgId) {
       const cap = `✅ انتهت:\n${info.title}`;
       if (info.isPhoto) {
@@ -694,6 +720,7 @@ export function startBot() {
         }).catch(() => {});
       }
     }
+    if (fileToDelete && existsSync(fileToDelete)) await unlink(fileToDelete).catch(() => {});
   });
 
   // Repeat playing — update repeat count in message
