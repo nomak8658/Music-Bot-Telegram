@@ -60,6 +60,10 @@ class VoiceManager extends EventEmitter {
           if (msg.event === "ready") {
             this.ready = true;
             this.emit("ready");
+          } else if (msg.event === "session_activated") {
+            // Background session init succeeded
+            logger.info(`VoiceService session activated: ${msg.name || ""}`);
+            this.emit("session_activated", msg);
           } else {
             const resolver = this.pendingResolvers.shift();
             if (resolver) resolver(msg);
