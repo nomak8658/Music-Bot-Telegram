@@ -34,6 +34,27 @@ const nowPlayingUser = new Map<number, number>();   // chatId -> userId who star
 const nowPlayingInfo = new Map<number, PlayInfo>(); // chatId -> song details
 const pendingQR      = new Map<number, number>();   // userId -> chatId (waiting for scan)
 
+// ─── Permission helpers ─────────────────────────────────────────────────────
+
+async function isGroupAdmin(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
+  try {
+    const member = await api.getChatMember(chatId, userId);
+    return member.status === "administrator" || member.status === "creator";
+  } catch {
+    return false;
+  }
+}
+
+async function canStop(chatId: number, userId: number, api: Bot["api"]): Promise<boolean> {
+  // Owner always can
+  if (OWNER_ID > 0 && userId === OWNER_ID) return true;
+  // Whoever started the song
+  const startedBy = nowPlayingUser.get(chatId);
+  if (!startedBy || userId === startedBy) return true;
+  // Group admins
+  return isGroupAdmin(chatId, userId, api);
+}
+
 // ─── Keyboard helpers ───────────────────────────────────────────────────────
 
 function buildNowPlayingKeyboard(chatId: number): InlineKeyboard {
@@ -381,9 +402,8 @@ bot.on("message:text", async (ctx) => {
   // ── وقف ──
   if (text === "وقف") {
     if (!voiceManager.isReady()) return ctx.reply("❌ خدمة المكالمات غير متاحة.");
-    const startedBy = nowPlayingUser.get(chatId);
-    if (startedBy && userId !== startedBy && userId !== OWNER_ID) {
-      return ctx.reply("❌ فقط من شغّل الأغنية يمكنه إيقافها.");
+    if (!(await canStop(chatId, userId, ctx.api))) {
+      return ctx.reply("❌ فقط من شغّل الأغنية أو المشرفين يمكنهم إيقافها.");
     }
     const result = await stopCall(chatId, ctx.api);
     if (result.ok) {
@@ -410,11 +430,10 @@ bot.callbackQuery(/^dl:([^:]+):([^:]+):(.+)$/, async (ctx) => {
 bot.callbackQuery(/^vcstop:(-?\d+)$/, async (ctx) => {
   const chatId = parseInt(ctx.match[1]);
   const userId = ctx.from.id;
-  const startedBy = nowPlayingUser.get(chatId);
 
-  if (startedBy && userId !== startedBy && userId !== OWNER_ID) {
+  if (!(await canStop(chatId, userId, ctx.api))) {
     return ctx.answerCallbackQuery({
-      text: "❌ فقط من شغّل الأغنية يمكنه إيقافها.",
+      text: "❌ فقط من شغّل الأغنية أو المشرفين يمكنهم إيقافها.",
       show_alert: true,
     });
   }
