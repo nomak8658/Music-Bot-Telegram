@@ -287,6 +287,59 @@ async def cmd_skip(chat_id: int, audio_file: str):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _fix_session_string(sess_str: str) -> str:
+    """Fix malformed session strings (264 bytes instead of expected 263 for IPv4)."""
+    import base64 as _b64, struct as _struct
+    if not sess_str or len(sess_str) < 2:
+        return sess_str
+    b64_part = sess_str[1:]
+    # Telethon expects exactly 352 chars for IPv4
+    if len(b64_part) == 352:
+        return sess_str  # already correct
+    if len(b64_part) == 353:
+        # Extra character in b64 part — strip trailing '=' and re-decode
+        b64_clean = b64_part.rstrip('=')
+        raw = _b64.urlsafe_b64decode(b64_clean + '=' * (-len(b64_clean) % 4))
+        if len(raw) == 264:
+            # Take first 263 bytes (drop extra byte at end)
+            dc, ip_bytes, port, auth_key = _struct.unpack('>B4sH256s', raw[:263])
+            repacked = _struct.pack('>B4sH256s', dc, ip_bytes, port, auth_key)
+            fixed_b64 = _b64.urlsafe_b64encode(repacked).decode()
+            log(f"[session] fixed 264→263 bytes, DC={dc}, b64 {len(b64_part)}→{len(fixed_b64)}")
+            return '1' + fixed_b64
+    return sess_str
+
+
+async def _init_session_bg():
+    """Background task: connect Telethon, then notify via stdout."""
+    global tl_client
+    if not SESSION_STRING:
+        return
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        sess_str = _fix_session_string(SESSION_STRING)
+        tl = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
+        log("[session] connecting…")
+        await asyncio.wait_for(tl.connect(), timeout=30)
+        log("[session] connected, fetching me…")
+        me = await asyncio.wait_for(tl.get_me(), timeout=20)
+        if me is None:
+            await tl.disconnect()
+            log("[session] get_me() returned None — session invalid")
+            send({"ok": False, "event": "session_invalid", "error": "Session expired or revoked"})
+            return
+        tl_client = tl
+        log(f"[session] ready: {me.first_name}")
+        send({"ok": True, "event": "session_activated", "name": me.first_name or "", "phone": getattr(me, "phone", "") or ""})
+    except asyncio.TimeoutError:
+        log("[session] timeout connecting to Telegram")
+        send({"ok": False, "event": "session_invalid", "error": "Connection timeout — Railway may be blocking MTProto"})
+    except Exception as e:
+        log(f"[session] error: {traceback.format_exc()}")
+        send({"ok": False, "event": "session_invalid", "error": str(e)})
+
+
 async def main():
     global tl_client, calls
 
@@ -295,43 +348,11 @@ async def main():
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    send({"ok": True, "event": "debug", "msg": f"SESSION_STRING present: {bool(SESSION_STRING)}, len: {len(SESSION_STRING)}"})
+    # Send ready immediately so bot.ts can start processing commands.
+    # Session init runs in background — it sends session_activated when done.
+    send({"ok": True, "event": "ready", "session_active": False})
     if SESSION_STRING:
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-            # Fix malformed session strings: Telethon expects base64 length == 352 (IPv4)
-            # If b64 part is 353 chars and ends with '=' (erroneous extra padding), strip it
-            sess_str = SESSION_STRING
-            b64_part = sess_str[1:]
-            import base64 as _b64
-            if len(b64_part) == 353 and b64_part.endswith('='):
-                # strip extra '=' to get 352 chars, decode to 264 bytes
-                b64_clean = b64_part.rstrip('=')  # 352 chars
-                raw = _b64.urlsafe_b64decode(b64_clean + '=' * (-len(b64_clean) % 4))
-                # raw is 264 bytes; IPv4 struct needs 263 bytes (DC=1,IP=4,Port=2,Key=256)
-                # Try trimming the last byte (extra padding at end)
-                import struct as _struct
-                dc, ip_bytes, port, auth_key = _struct.unpack('>B4sH256s', raw[:263])
-                repacked = _struct.pack('>B4sH256s', dc, ip_bytes, port, auth_key)
-                fixed_b64 = _b64.urlsafe_b64encode(repacked).decode()
-                sess_str = '1' + fixed_b64
-                send({"ok": True, "event": "debug", "msg": f"Session fixed: b64 len {len(b64_part)}→{len(fixed_b64)}, DC={dc}"})
-            tl = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
-            send({"ok": True, "event": "debug", "msg": "Connecting to Telegram..."})
-            await tl.connect()
-            send({"ok": True, "event": "debug", "msg": "Connected. Checking authorization..."})
-            me = await tl.get_me()
-            if me is None:
-                await tl.disconnect()
-                raise RuntimeError("Session not authorized (expired or revoked)")
-            tl_client = tl
-            send({"ok": True, "event": "ready", "session_active": True, "name": me.first_name or ""})
-        except Exception as e:
-            log(f"[startup] session error: {traceback.format_exc()}")
-            send({"ok": True, "event": "ready", "session_active": False, "error": str(e)})
-    else:
-        send({"ok": True, "event": "ready"})
+        asyncio.create_task(_init_session_bg())
 
     while True:
         try:
