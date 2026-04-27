@@ -130,12 +130,24 @@ async def _handle_stream_end(chat_id: int):
             repeat_state[chat_id] = (file_path, remaining - 1)
             try:
                 from pytgcalls.types import MediaStream, AudioQuality
+                try:
+                    from pytgcalls.types import AudioParameters
+                    _have_ap = True
+                except ImportError:
+                    _have_ap = False
                 tgc = await get_calls()
-                stream = MediaStream(
-                    file_path,
-                    audio_parameters=AudioQuality.HIGH,
-                    video_flags=MediaStream.Flags.IGNORE,
-                )
+                if file_path.endswith(".raw") and _have_ap:
+                    stream = MediaStream(
+                        file_path,
+                        audio_parameters=AudioParameters(48000, 2, 16),
+                        video_flags=MediaStream.Flags.IGNORE,
+                    )
+                else:
+                    stream = MediaStream(
+                        file_path,
+                        audio_parameters=AudioQuality.HIGH,
+                        video_flags=MediaStream.Flags.IGNORE,
+                    )
                 await tgc.play(chat_id, stream)
                 send({"ok": True, "event": "repeat_playing",
                       "chat_id": chat_id, "remaining": remaining - 1})
@@ -143,6 +155,15 @@ async def _handle_stream_end(chat_id: int):
             except Exception as e:
                 log(f"[repeat] play error: {e}")
         del repeat_state[chat_id]
+
+    # Cleanup PCM file when stream is truly done
+    pcm = pcm_files.pop(chat_id, None)
+    if pcm and Path(pcm).exists():
+        try:
+            Path(pcm).unlink()
+        except Exception:
+            pass
+
     send({"ok": True, "event": "stream_ended", "chat_id": chat_id})
 
 # ---------------------------------------------------------------------------
@@ -267,9 +288,43 @@ async def cmd_check_participant(chat_id: int, user_id: int):
 # Voice call commands
 # ---------------------------------------------------------------------------
 
+pcm_files: dict = {}   # chat_id -> pcm file path (for cleanup)
+
+
+async def _prepare_audio(audio_file: str) -> str:
+    """
+    Convert audio to RAW PCM s16le 48kHz stereo before playing.
+    This prevents stuttering caused by real-time MP3 decoding in voice calls.
+    Returns path to the PCM file (or original if ffmpeg fails).
+    """
+    pcm_file = audio_file.rsplit(".", 1)[0] + ".raw"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", audio_file,
+            "-f", "s16le", "-ar", "48000", "-ac", "2",
+            "-acodec", "pcm_s16le",
+            pcm_file,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode == 0 and Path(pcm_file).exists():
+            log(f"[prepare] converted to PCM: {pcm_file}")
+            return pcm_file
+    except Exception as e:
+        log(f"[prepare] ffmpeg error: {e}")
+    log(f"[prepare] falling back to original: {audio_file}")
+    return audio_file
+
+
 async def cmd_join_and_play(chat_id: int, audio_file: str):
     try:
         from pytgcalls.types import MediaStream, AudioQuality
+        try:
+            from pytgcalls.types import AudioParameters
+            _have_audio_params = True
+        except ImportError:
+            _have_audio_params = False
 
         if not Path(audio_file).exists():
             send({"ok": False, "error": f"Audio file not found: {audio_file}",
@@ -285,13 +340,25 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
                   "chat_id": chat_id})
             return
 
+        # Pre-convert to PCM for smooth playback (no real-time decode)
+        play_file = await _prepare_audio(audio_file)
+        pcm_files[chat_id] = play_file if play_file != audio_file else None
+
         tgc = await get_calls()
 
-        stream = MediaStream(
-            audio_file,
-            audio_parameters=AudioQuality.HIGH,
-            video_flags=MediaStream.Flags.IGNORE,
-        )
+        # Build stream — PCM needs explicit AudioParameters, MP3 uses AudioQuality
+        if play_file.endswith(".raw") and _have_audio_params:
+            stream = MediaStream(
+                play_file,
+                audio_parameters=AudioParameters(48000, 2, 16),
+                video_flags=MediaStream.Flags.IGNORE,
+            )
+        else:
+            stream = MediaStream(
+                play_file,
+                audio_parameters=AudioQuality.HIGH,
+                video_flags=MediaStream.Flags.IGNORE,
+            )
         await tgc.play(chat_id, stream)
 
         vol = volume_state.get(chat_id, 100)
@@ -299,6 +366,11 @@ async def cmd_join_and_play(chat_id: int, audio_file: str):
             await tgc.change_volume_call(chat_id, vol)
         except Exception:
             pass
+
+        # Store PCM path for repeat functionality
+        if chat_id in repeat_state:
+            old_path, old_count = repeat_state[chat_id]
+            repeat_state[chat_id] = (play_file, old_count)
 
         send({"ok": True, "event": "playing", "chat_id": chat_id})
         log(f"[play] started for {chat_id}")
@@ -313,6 +385,13 @@ async def cmd_stop(chat_id: int):
         tgc = await get_calls()
         await tgc.leave_call(chat_id)
         repeat_state.pop(chat_id, None)
+        # Cleanup PCM file if any
+        pcm = pcm_files.pop(chat_id, None)
+        if pcm and Path(pcm).exists():
+            try:
+                Path(pcm).unlink()
+            except Exception:
+                pass
         send({"ok": True, "event": "stopped", "chat_id": chat_id})
     except Exception as e:
         log(f"[stop] error: {e}")
