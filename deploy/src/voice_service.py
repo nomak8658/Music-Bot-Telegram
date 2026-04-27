@@ -398,6 +398,7 @@ async def _init_session_bg():
         asyncio.create_task(_keepalive_loop())
     except Exception as e:
         log(f"[session] restore error: {e}")
+        send({"ok": False, "event": "session_restore_failed", "error": str(e)})
 
 # ---------------------------------------------------------------------------
 # Main loop
