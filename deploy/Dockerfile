@@ -1,7 +1,5 @@
 FROM node:20-slim
 
-ARG CACHEBUST=2026-04-27-v5
-
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev \
     ffmpeg \
@@ -11,11 +9,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 COPY . .
 RUN node ./build.mjs
 
+# CACHEBUST only affects pip layer — npm layer stays cached
+ARG CACHEBUST=2026-04-27-v5
 RUN pip3 install --no-cache-dir --break-system-packages \
     telethon \
     py-tgcalls \
