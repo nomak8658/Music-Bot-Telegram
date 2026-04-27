@@ -287,6 +287,33 @@ async def cmd_skip(chat_id: int, audio_file: str):
 # Main loop
 # ---------------------------------------------------------------------------
 
+async def _init_session_bg():
+    """Background task: restore saved Telethon session without blocking the command loop."""
+    global tl_client
+    if not SESSION_STRING:
+        return
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        tl = TelegramClient(
+            StringSession(SESSION_STRING), API_ID, API_HASH,
+            connection_retries=1, retry_delay=2, timeout=15,
+        )
+        log("[session] connecting with saved session…")
+        await tl.connect()
+        me = await tl.get_me()
+        if me is None:
+            await tl.disconnect()
+            log("[session] get_me() returned None — session invalid")
+            return
+        tl_client = tl
+        log(f"[session] restored: {me.first_name}")
+        send({"ok": True, "event": "session_activated",
+              "name": me.first_name or "", "phone": getattr(me, "phone", "") or ""})
+    except Exception as e:
+        log(f"[session] restore error: {e}")
+
+
 async def main():
     global tl_client, calls
 
@@ -295,9 +322,11 @@ async def main():
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    # Always start ready immediately. Session is restored via cmd_restore_session
-    # triggered by bot.ts after ready, or user does /qr for fresh login.
+    # Send ready immediately so commands can be processed right away.
+    # Saved session restores in background — fires session_activated when done.
     send({"ok": True, "event": "ready", "session_active": False})
+    if SESSION_STRING:
+        asyncio.create_task(_init_session_bg())
 
     while True:
         try:
