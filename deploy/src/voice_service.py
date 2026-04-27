@@ -295,12 +295,18 @@ async def main():
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
+    send({"ok": True, "event": "debug", "msg": f"SESSION_STRING present: {bool(SESSION_STRING)}, len: {len(SESSION_STRING)}"})
     if SESSION_STRING:
         try:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             tl = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await tl.start()
+            send({"ok": True, "event": "debug", "msg": "Connecting to Telegram..."})
+            await tl.connect()
+            send({"ok": True, "event": "debug", "msg": "Connected. Checking authorization..."})
+            if not await tl.is_user_authorized():
+                await tl.disconnect()
+                raise RuntimeError("Session not authorized (expired or revoked)")
             me = await tl.get_me()
             tl_client = tl
             send({"ok": True, "event": "ready", "session_active": True, "name": me.first_name or ""})
