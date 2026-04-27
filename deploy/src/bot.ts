@@ -286,12 +286,12 @@ export function startBot() {
 
   voiceManager.once("ready", async () => {
     logger.info("VoiceService is ready");
-    const check = await voiceManager.checkSession();
-    if (check.ok) {
-      logger.info({ name: check.name }, "User session active");
-    } else {
-      logger.warn("No active user session — use /qr to log in");
-    }
+    logger.warn("No active user session yet — connecting in background (or use /qr to log in)");
+  });
+
+  // Background Telethon session connected successfully
+  voiceManager.on("session_activated", (msg: { name?: string; phone?: string }) => {
+    logger.info({ name: msg.name }, "User session activated (background)");
   });
 
   // Handle async QR events (fired after user scans or timeout)
