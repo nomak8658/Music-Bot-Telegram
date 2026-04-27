@@ -151,31 +151,100 @@ async function editNowPlaying(
 
 // ─── SoundCloud helpers ───────────────────────────────────────────────────────
 
-type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbUrl?: string };
+type VideoResult = {
+  id: string; title: string;
+  duration: string; durationSec: number;
+  uploader: string; thumbUrl?: string;
+};
 
 function ytCookiesArgs(): string[] {
   return existsSync(YT_COOKIES_FILE) ? ["--cookies", YT_COOKIES_FILE] : [];
 }
 
+function parseDuration(secStr: string): number {
+  return parseInt(secStr ?? "0") || 0;
+}
+
+function fmtDuration(sec: number): string {
+  if (!sec) return "?:??";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Search SoundCloud — returns results sorted longest-first when fullOnly=true
 async function searchSoundCloud(query: string, limit = 5): Promise<VideoResult[]> {
   const { stdout } = await execFileAsync("yt-dlp", [
     `scsearch${limit}:${query}`,
-    "--print", "%(webpage_url)s|||%(title)s|||%(duration_string)s|||%(uploader)s|||%(thumbnail)s",
+    "--print", "%(webpage_url)s|||%(title)s|||%(duration)s|||%(uploader)s|||%(thumbnail)s",
     "--no-download", "--no-playlist", "--socket-timeout", "20", "--quiet",
   ]);
   return stdout.trim().split("\n")
     .filter(l => l.includes("|||"))
     .map(l => {
       const p = l.split("|||");
+      const durationSec = parseDuration(p[2]?.trim() ?? "0");
       return {
-        id: p[0]?.trim() ?? "",        // full SoundCloud URL
+        id: p[0]?.trim() ?? "",
         title: p[1]?.trim() ?? "",
-        duration: p[2]?.trim() ?? "",
+        durationSec,
+        duration: fmtDuration(durationSec),
         uploader: p[3]?.trim() ?? "",
         thumbUrl: p[4]?.trim() || undefined,
       };
     })
     .filter(r => r.id.startsWith("http"));
+}
+
+// Try YouTube as fallback (may fail on cloud IPs — caught silently)
+async function searchYouTube(query: string, limit = 3): Promise<VideoResult[]> {
+  const { stdout } = await execFileAsync("yt-dlp", [
+    `ytsearch${limit}:${query}`,
+    "--print", "%(webpage_url)s|||%(title)s|||%(duration)s|||%(uploader)s|||%(thumbnail)s",
+    "--no-download", "--no-playlist", "--socket-timeout", "15", "--quiet",
+    ...ytCookiesArgs(),
+  ]);
+  return stdout.trim().split("\n")
+    .filter(l => l.includes("|||"))
+    .map(l => {
+      const p = l.split("|||");
+      const durationSec = parseDuration(p[2]?.trim() ?? "0");
+      return {
+        id: p[0]?.trim() ?? "",
+        title: p[1]?.trim() ?? "",
+        durationSec,
+        duration: fmtDuration(durationSec),
+        uploader: p[3]?.trim() ?? "",
+        thumbUrl: p[4]?.trim() || undefined,
+      };
+    })
+    .filter(r => r.id.startsWith("http") && r.durationSec >= 60);
+}
+
+// Find best full-length track: SC first (skip previews <60s), YouTube fallback
+async function findBestTrack(query: string): Promise<VideoResult & { source?: string } | null> {
+  // Search SC with 15 results to increase chance of finding full version
+  try {
+    const scResults = await searchSoundCloud(query, 15);
+    const full = scResults.filter(r => r.durationSec >= 60);
+    if (full.length > 0) {
+      // Pick the longest match among results (likely the full original)
+      full.sort((a, b) => b.durationSec - a.durationSec);
+      return { ...full[0], source: "sc" };
+    }
+  } catch (e) {
+    logger.warn({ e }, "SoundCloud search failed");
+  }
+
+  // Fallback: YouTube
+  try {
+    const ytResults = await searchYouTube(query, 5);
+    if (ytResults.length > 0) {
+      ytResults.sort((a, b) => b.durationSec - a.durationSec);
+      return { ...ytResults[0], source: "yt" };
+    }
+  } catch { /* YouTube blocked on cloud IPs — silently ignore */ }
+
+  return null;
 }
 
 // For sending in chat (يوت / بحث) — MP3 so Telegram shows it as audio track
@@ -498,9 +567,9 @@ bot.on("message:text", async (ctx) => {
     if (!query) return ctx.reply("⚠️ اكتب اسم الأغنية بعد *يوت*", { parse_mode: "Markdown" });
     await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
-      const results = await searchSoundCloud(query, 1);
-      if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
-      await sendAudioFile(chatId, results[0].id, results[0].title, results[0].uploader, ctx.api);
+      const top = await findBestTrack(query);
+      if (!top) return ctx.reply("❌ ما لقيت نتائج.");
+      await sendAudioFile(chatId, top.id, top.title, top.uploader, ctx.api);
     } catch (err) {
       logger.error({ err }, "يوت error");
       const msg = (err as Error).message ?? String(err);
@@ -562,9 +631,8 @@ bot.on("message:text", async (ctx) => {
     if (nowPlayingInfo.has(chatId)) {
       await ctx.reply(`🔍 أبحث عن: ${query}`);
       try {
-        const results = await searchSoundCloud(query, 1);
-        if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
-        const top = results[0];
+        const top = await findBestTrack(query);
+        if (!top) return ctx.reply("❌ ما لقيت نتائج.");
         const queue = getQueue(chatId);
         queue.push({ videoId: top.id, title: top.title, uploader: top.uploader, userId, userName, thumbUrl: top.thumbUrl });
         const pos = queue.length;
@@ -587,9 +655,8 @@ bot.on("message:text", async (ctx) => {
     // Nothing playing → play directly
     await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
-      const results = await searchSoundCloud(query, 1);
-      if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
-      const top = results[0];
+      const top = await findBestTrack(query);
+      if (!top) return ctx.reply("❌ ما لقيت نتائج.");
       await playInCall(chatId, top.id, top.title, top.uploader, userId, ctx.api, top.thumbUrl);
     } catch (err) {
       logger.error({ err }, "شغل error");
