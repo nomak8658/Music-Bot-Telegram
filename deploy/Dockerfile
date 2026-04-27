@@ -1,6 +1,7 @@
 FROM node:20-slim
 
-# Install Python 3 + ffmpeg + build tools
+ARG CACHEBUST=2026-04-27-v3
+
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev \
     ffmpeg \
@@ -9,15 +10,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Node dependencies
 COPY package.json ./
 RUN npm install
 
-# Copy source and build
 COPY . .
 RUN node ./build.mjs
 
-# Install Python dependencies
 RUN pip3 install --no-cache-dir --break-system-packages \
     telethon \
     py-tgcalls \
