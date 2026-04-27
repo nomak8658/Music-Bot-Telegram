@@ -69,21 +69,52 @@ async def get_calls():
         from pytgcalls import PyTgCalls
         calls = PyTgCalls(tl_client)
 
-        @calls.on_stream_end()
-        async def on_stream_end(client, *args):
+        # Log available stream/update-related attrs for debugging
+        _attrs = [a for a in dir(calls) if any(k in a.lower() for k in ('stream','update','end','event'))]
+        log(f"[calls] available attrs: {_attrs}")
+
+        # Register stream-end handler — API differs by py-tgcalls version
+        _registered = False
+
+        # Try 1.x / early 2.x style
+        if not _registered and hasattr(calls, 'on_stream_end'):
             try:
-                update = args[0] if args else None
-                if update is None:
-                    return
-                chat_id = getattr(update, 'chat_id', None)
-                if chat_id is None:
+                @calls.on_stream_end()
+                async def _on_stream_end_v1(client, *args):
                     try:
-                        chat_id = int(update)
-                    except Exception:
-                        return
-                await _handle_stream_end(chat_id)
+                        update = args[0] if args else None
+                        chat_id = getattr(update, 'chat_id', None)
+                        if chat_id is None:
+                            chat_id = int(update) if update else None
+                        if chat_id:
+                            await _handle_stream_end(chat_id)
+                    except Exception as e:
+                        log(f"[stream_end v1] {e}")
+                _registered = True
+                log("[calls] stream_end handler registered (v1 API)")
             except Exception as e:
-                log(f"[stream_end handler] {e}")
+                log(f"[calls] on_stream_end v1 failed: {e}")
+
+        # Try 2.x on_update style
+        if not _registered and hasattr(calls, 'on_update'):
+            try:
+                @calls.on_update()
+                async def _on_update_v2(client, update):
+                    try:
+                        cls_name = type(update).__name__
+                        if 'StreamEnded' in cls_name or 'stream_end' in cls_name.lower():
+                            chat_id = getattr(update, 'chat_id', None)
+                            if chat_id:
+                                await _handle_stream_end(chat_id)
+                    except Exception as e:
+                        log(f"[stream_end v2] {e}")
+                _registered = True
+                log("[calls] stream_end handler registered (v2 on_update API)")
+            except Exception as e:
+                log(f"[calls] on_update v2 failed: {e}")
+
+        if not _registered:
+            log("[calls] WARNING: stream_end handler not registered — repeat/cleanup disabled")
 
         await calls.start()
         await asyncio.sleep(0.3)
