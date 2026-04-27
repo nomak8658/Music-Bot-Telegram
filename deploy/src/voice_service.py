@@ -23,6 +23,11 @@ API_ID   = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
+# Debug: log session string status at startup  
+import sys as _sys
+_sys.stderr.write(f"[VS_STARTUP] SESSION_STRING set: {bool(SESSION_STRING)}, len={len(SESSION_STRING)}\n")
+_sys.stderr.flush()
+
 tl_client = None
 calls     = None
 
