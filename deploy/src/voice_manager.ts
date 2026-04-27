@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-type VoiceMsg = { ok: boolean; event?: string; error?: string; [key: string]: unknown };
-type PendingResolve = (msg: VoiceMsg) => void;
+type VoiceMsg = { ok: boolean; event?: string; error?: string; req_id?: string; [key: string]: unknown };
+type Pending = { resolve: (msg: VoiceMsg) => void; timer: ReturnType<typeof setTimeout> };
 
-// Async/unsolicited events — must not consume a pending resolver
+// Pure push events — never solicited responses
 const ASYNC_EVENTS = new Set([
   "ready", "session_activated",
   "stream_ended", "repeat_playing",
@@ -20,7 +20,8 @@ const ASYNC_EVENTS = new Set([
 class VoiceManager extends EventEmitter {
   private proc: ChildProcess | null = null;
   private buffer = "";
-  private pendingResolvers: PendingResolve[] = [];
+  private pending = new Map<string, Pending>();
+  private reqCount = 0;
   private ready = false;
 
   start() {
@@ -60,24 +61,37 @@ class VoiceManager extends EventEmitter {
         if (!line.trim()) continue;
         try {
           const msg: VoiceMsg = JSON.parse(line);
-          logger.info(`VoiceService msg: ${JSON.stringify(msg)}`);
+          logger.debug({ msg }, "VoiceService →");
 
+          // Pure async push events
           if (msg.event === "ready") {
             this.ready = true;
             this.emit("ready");
-          } else if (msg.event === "session_activated") {
-            logger.info(`VoiceService session activated: ${msg.name || ""}`);
-            this.emit("session_activated", msg);
-          } else if (ASYNC_EVENTS.has(msg.event ?? "")) {
-            // Unsolicited events bypass the resolver queue
-            this.emit(msg.event as string, msg);
-          } else {
-            // Solicited response — give to next pending resolver
-            const resolver = this.pendingResolvers.shift();
-            if (resolver) resolver(msg);
-            else this.emit("message", msg);
+            continue;
           }
-        } catch { /* ignore parse errors */ }
+          if (msg.event === "session_activated") {
+            this.emit("session_activated", msg);
+            continue;
+          }
+          if (ASYNC_EVENTS.has(msg.event ?? "")) {
+            this.emit(msg.event as string, msg);
+            continue;
+          }
+
+          // Solicited response — match by req_id
+          const id = msg.req_id ?? "";
+          const entry = id ? this.pending.get(id) : undefined;
+          if (entry) {
+            clearTimeout(entry.timer);
+            this.pending.delete(id);
+            entry.resolve(msg);
+          } else {
+            // No matching request — emit as generic message
+            logger.warn({ msg }, "VoiceService: unmatched response");
+          }
+        } catch (e) {
+          logger.warn({ line, e }, "VoiceService: JSON parse error");
+        }
       }
     });
 
@@ -90,9 +104,12 @@ class VoiceManager extends EventEmitter {
       logger.warn({ code }, "VoiceService exited — restarting in 3s");
       this.ready = false;
       this.proc = null;
-      // Drain any pending resolvers with error so callers don't hang
-      for (const r of this.pendingResolvers) r({ ok: false, error: "VoiceService restarted" });
-      this.pendingResolvers = [];
+      // Drain pending with error so callers don't hang
+      for (const [id, { resolve, timer }] of this.pending) {
+        clearTimeout(timer);
+        resolve({ ok: false, error: "VoiceService restarted", req_id: id });
+      }
+      this.pending.clear();
       setTimeout(() => this.start(), 3000);
     });
   }
@@ -102,36 +119,44 @@ class VoiceManager extends EventEmitter {
     this.proc.stdin.write(JSON.stringify(cmd) + "\n");
   }
 
-  private request(cmd: object): Promise<VoiceMsg> {
+  private request(cmd: object, timeoutMs = 25000): Promise<VoiceMsg> {
     return new Promise((resolve) => {
-      this.pendingResolvers.push(resolve);
-      this.send(cmd);
+      const req_id = `r${++this.reqCount}_${Date.now()}`;
+      const timer = setTimeout(() => {
+        if (this.pending.has(req_id)) {
+          this.pending.delete(req_id);
+          logger.warn({ req_id, cmd }, "VoiceService request timed out");
+          resolve({ ok: false, error: "Voice service timeout", req_id });
+        }
+      }, timeoutMs);
+      this.pending.set(req_id, { resolve, timer });
+      this.send({ ...cmd, req_id });
     });
   }
 
   isReady() { return this.ready; }
 
-  qrLogin()          { return this.request({ cmd: "qr_login" }); }
-  checkSession()     { return this.request({ cmd: "check_session" }); }
+  qrLogin()      { return this.request({ cmd: "qr_login" }, 130_000); }
+  checkSession() { return this.request({ cmd: "check_session" }); }
 
   checkParticipant(chatId: number, userId: number) {
-    return this.request({ cmd: "check_participant", chat_id: chatId, user_id: userId });
+    return this.request({ cmd: "check_participant", chat_id: chatId, user_id: userId }, 12_000);
   }
 
   joinAndPlay(chatId: number, audioFile: string) {
-    return this.request({ cmd: "join_and_play", chat_id: chatId, audio_file: audioFile });
+    return this.request({ cmd: "join_and_play", chat_id: chatId, audio_file: audioFile }, 30_000);
   }
 
   stop(chatId: number) {
-    return this.request({ cmd: "stop", chat_id: chatId });
+    return this.request({ cmd: "stop", chat_id: chatId }, 12_000);
   }
 
   setVolume(chatId: number, volume: number) {
-    return this.request({ cmd: "set_volume", chat_id: chatId, volume });
+    return this.request({ cmd: "set_volume", chat_id: chatId, volume }, 10_000);
   }
 
   setRepeat(chatId: number, audioFile: string, count: number) {
-    return this.request({ cmd: "set_repeat", chat_id: chatId, audio_file: audioFile, count });
+    return this.request({ cmd: "set_repeat", chat_id: chatId, audio_file: audioFile, count }, 10_000);
   }
 }
 
