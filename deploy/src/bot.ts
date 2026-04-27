@@ -314,13 +314,17 @@ bot.command("start", (ctx) =>
   ),
 );
 
-// /qr — PRIVATE CHAT ONLY (no exceptions)
+// /qr — OWNER in PRIVATE CHAT ONLY
 bot.command("qr", async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
   if (ctx.chat.type !== "private") {
-    return ctx.reply("❌ هذا الأمر يعمل في المحادثة الخاصة مع البوت فقط.\n\nافتح محادثة خاصة مع البوت وأرسل /qr");
+    return ctx.reply("❌ هذا الأمر يعمل في المحادثة الخاصة مع البوت فقط.");
+  }
+
+  if (OWNER_ID > 0 && userId !== OWNER_ID) {
+    return ctx.reply("❌ هذا الأمر للمالك فقط.");
   }
 
   if (!voiceManager.isReady()) {
