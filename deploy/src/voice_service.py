@@ -300,14 +300,31 @@ async def main():
         try:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
-            tl = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+            # Fix malformed session strings: Telethon expects base64 length == 352 (IPv4)
+            # If b64 part is 353 chars and ends with '=' (erroneous extra padding), strip it
+            sess_str = SESSION_STRING
+            b64_part = sess_str[1:]
+            import base64 as _b64
+            if len(b64_part) == 353 and b64_part.endswith('='):
+                # strip extra '=' to get 352 chars, decode to 264 bytes
+                b64_clean = b64_part.rstrip('=')  # 352 chars
+                raw = _b64.urlsafe_b64decode(b64_clean + '=' * (-len(b64_clean) % 4))
+                # raw is 264 bytes; IPv4 struct needs 263 bytes (DC=1,IP=4,Port=2,Key=256)
+                # Try trimming the last byte (extra padding at end)
+                import struct as _struct
+                dc, ip_bytes, port, auth_key = _struct.unpack('>B4sH256s', raw[:263])
+                repacked = _struct.pack('>B4sH256s', dc, ip_bytes, port, auth_key)
+                fixed_b64 = _b64.urlsafe_b64encode(repacked).decode()
+                sess_str = '1' + fixed_b64
+                send({"ok": True, "event": "debug", "msg": f"Session fixed: b64 len {len(b64_part)}→{len(fixed_b64)}, DC={dc}"})
+            tl = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
             send({"ok": True, "event": "debug", "msg": "Connecting to Telegram..."})
             await tl.connect()
             send({"ok": True, "event": "debug", "msg": "Connected. Checking authorization..."})
-            if not await tl.is_user_authorized():
+            me = await tl.get_me()
+            if me is None:
                 await tl.disconnect()
                 raise RuntimeError("Session not authorized (expired or revoked)")
-            me = await tl.get_me()
             tl_client = tl
             send({"ok": True, "event": "ready", "session_active": True, "name": me.first_name or ""})
         except Exception as e:
