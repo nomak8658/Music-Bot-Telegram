@@ -183,9 +183,16 @@ async function downloadAudio(songUrl: string): Promise<string> {
   const outTemplate = `${tmpdir()}/tg_audio_${Date.now()}.%(ext)s`;
   await execFileAsync("yt-dlp", [
     songUrl,
-    "-x", "--audio-format", "mp3", "--audio-quality", "0",
-    "--postprocessor-args", "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0",
-    "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
+    "-x", "--audio-format", "mp3",
+    // Use explicit CBR 192k — no conflicting quality flags, keeps XING header
+    // so Telegram shows correct duration
+    "--postprocessor-args", "ffmpeg:-acodec libmp3lame -b:a 192k -ar 48000 -ac 2",
+    "-o", outTemplate,
+    "--no-playlist",
+    "--retries", "5",
+    "--fragment-retries", "5",
+    "--socket-timeout", "30",
+    "--quiet",
     ...ytCookiesArgs(),
   ], { maxBuffer: 100 * 1024 * 1024 });
   return outTemplate.replace("%(ext)s", "mp3");
@@ -202,7 +209,12 @@ async function downloadAudioForCall(songUrl: string): Promise<string> {
   await execFileAsync("yt-dlp", [
     songUrl,
     "-x", "--audio-format", "mp3",
-    "-o", mp3Path, "--no-playlist", "--socket-timeout", "30", "--quiet",
+    "-o", mp3Path,
+    "--no-playlist",
+    "--retries", "5",
+    "--fragment-retries", "5",
+    "--socket-timeout", "30",
+    "--quiet",
     ...ytCookiesArgs(),
   ], { maxBuffer: 100 * 1024 * 1024 });
 
