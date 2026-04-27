@@ -181,6 +181,8 @@ async function downloadAudio(songUrl: string): Promise<string> {
   await execFileAsync("yt-dlp", [
     songUrl,
     "-x", "--audio-format", "mp3", "--audio-quality", "128K",
+    // Normalize to CBR 128k, 48kHz stereo — prevents stuttering in voice calls
+    "--postprocessor-args", "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0",
     "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
     ...ytCookiesArgs(),
   ]);
