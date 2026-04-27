@@ -178,19 +178,47 @@ async function searchSoundCloud(query: string, limit = 5): Promise<VideoResult[]
     .filter(r => r.id.startsWith("http"));
 }
 
+// For sending in chat (يوت / بحث) — MP3 so Telegram shows it as audio track
 async function downloadAudio(songUrl: string): Promise<string> {
   const outTemplate = `${tmpdir()}/tg_audio_${Date.now()}.%(ext)s`;
   await execFileAsync("yt-dlp", [
     songUrl,
     "-x", "--audio-format", "mp3", "--audio-quality", "0",
-    // CBR 128k, 48kHz stereo + audio normalization → prevents stuttering
-    "--postprocessor-args",
-    "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0 -af dynaudnorm=f=150:g=15",
+    "--postprocessor-args", "ffmpeg:-ar 48000 -ac 2 -b:a 128k -write_xing 0",
     "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
     ...ytCookiesArgs(),
-  ], { maxBuffer: 100 * 1024 * 1024 }); // 100MB buffer
-  const outPath = outTemplate.replace("%(ext)s", "mp3");
-  return outPath;
+  ], { maxBuffer: 100 * 1024 * 1024 });
+  return outTemplate.replace("%(ext)s", "mp3");
+}
+
+// For voice calls (شغل) — OGG Opus: native Telegram call format,
+// no real-time decoding by pytgcalls → zero stutter.
+async function downloadAudioForCall(songUrl: string): Promise<string> {
+  const ts = Date.now();
+  const mp3Path = `${tmpdir()}/tg_raw_${ts}.mp3`;
+  const oggPath = `${tmpdir()}/tg_call_${ts}.ogg`;
+
+  // Step 1: download best audio as MP3
+  await execFileAsync("yt-dlp", [
+    songUrl,
+    "-x", "--audio-format", "mp3",
+    "-o", mp3Path, "--no-playlist", "--socket-timeout", "30", "--quiet",
+    ...ytCookiesArgs(),
+  ], { maxBuffer: 100 * 1024 * 1024 });
+
+  // Step 2: convert to OGG Opus — 48kHz stereo 128kbps (Telegram native)
+  await execFileAsync("ffmpeg", [
+    "-y", "-i", mp3Path,
+    "-c:a", "libopus",
+    "-b:a", "128k",
+    "-ar", "48000",
+    "-ac", "2",
+    "-vn",
+    oggPath,
+  ]);
+
+  await unlink(mp3Path).catch(() => {});
+  return oggPath;
 }
 
 // ─── Send audio (يوت/بحث) ────────────────────────────────────────────────────
@@ -257,7 +285,7 @@ async function playInCall(
       isPhoto = false;
     }
 
-    filePath = await downloadAudio(songUrl);
+    filePath = await downloadAudioForCall(songUrl);
     if (!existsSync(filePath)) throw new Error("File not found after download");
 
     const result = await voiceManager.joinAndPlay(chatId, filePath);
