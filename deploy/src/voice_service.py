@@ -183,6 +183,7 @@ async def _wait_telethon_qr(tl, qr):
         session_str = tl.session.save()
         tl_client = tl
         calls = None
+        asyncio.create_task(_keepalive_loop())
         send({
             "ok": True,
             "event": "qr_logged_in",
@@ -344,6 +345,27 @@ async def cmd_set_repeat(chat_id: int, audio_file: str, count: int):
 # Session background restore
 # ---------------------------------------------------------------------------
 
+async def _keepalive_loop():
+    """Ping Telegram every 60s to keep the connection alive."""
+    global tl_client
+    while True:
+        await asyncio.sleep(60)
+        if tl_client is not None:
+            try:
+                if not tl_client.is_connected():
+                    log("[keepalive] disconnected — reconnecting…")
+                    await tl_client.connect()
+                else:
+                    await tl_client.get_me()
+            except Exception as e:
+                log(f"[keepalive] error: {e}")
+                # Try to reconnect
+                try:
+                    await tl_client.connect()
+                except Exception:
+                    pass
+
+
 async def _init_session_bg():
     global tl_client
     if not SESSION_STRING:
@@ -353,7 +375,8 @@ async def _init_session_bg():
         from telethon.sessions import StringSession
         tl = TelegramClient(
             StringSession(SESSION_STRING), API_ID, API_HASH,
-            connection_retries=2, retry_delay=3, timeout=20,
+            connection_retries=-1, retry_delay=2, timeout=30,
+            auto_reconnect=True,
         )
         log("[session] connecting with saved session…")
         await tl.connect()
@@ -367,6 +390,7 @@ async def _init_session_bg():
         send({"ok": True, "event": "session_activated",
               "name": me.first_name or "",
               "phone": getattr(me, "phone", "") or ""})
+        asyncio.create_task(_keepalive_loop())
     except Exception as e:
         log(f"[session] restore error: {e}")
 
