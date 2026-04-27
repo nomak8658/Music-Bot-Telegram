@@ -12,7 +12,7 @@ type Pending = { resolve: (msg: VoiceMsg) => void; timer: ReturnType<typeof setT
 
 // Pure push events — never solicited responses
 const ASYNC_EVENTS = new Set([
-  "ready", "session_activated",
+  "ready", "session_activated", "session_restore_failed",
   "stream_ended", "repeat_playing",
   "qr_logged_in", "qr_timeout", "qr_error",
 ]);
@@ -23,6 +23,7 @@ class VoiceManager extends EventEmitter {
   private pending = new Map<string, Pending>();
   private reqCount = 0;
   private ready = false;
+  private sessionActive = false;
 
   start() {
     const venvDir = join(__dirname, "..", ".venv");
@@ -70,8 +71,17 @@ class VoiceManager extends EventEmitter {
             continue;
           }
           if (msg.event === "session_activated") {
+            this.sessionActive = true;
             this.emit("session_activated", msg);
             continue;
+          }
+          if (msg.event === "session_restore_failed") {
+            this.sessionActive = false;
+            this.emit("session_restore_failed", msg);
+            continue;
+          }
+          if (msg.event === "qr_logged_in") {
+            this.sessionActive = true;
           }
           if (ASYNC_EVENTS.has(msg.event ?? "")) {
             this.emit(msg.event as string, msg);
@@ -103,6 +113,7 @@ class VoiceManager extends EventEmitter {
     this.proc.on("exit", (code) => {
       logger.warn({ code }, "VoiceService exited — restarting in 3s");
       this.ready = false;
+      this.sessionActive = false;
       this.proc = null;
       // Drain pending with error so callers don't hang
       for (const [id, { resolve, timer }] of this.pending) {
@@ -134,7 +145,8 @@ class VoiceManager extends EventEmitter {
     });
   }
 
-  isReady() { return this.ready; }
+  isReady()         { return this.ready; }
+  isSessionActive() { return this.sessionActive; }
 
   qrLogin()      { return this.request({ cmd: "qr_login" }, 130_000); }
   checkSession() { return this.request({ cmd: "check_session" }); }
