@@ -277,16 +277,35 @@ async function playInCall(
 
   } catch (err) {
     logger.error({ err }, "Voice call play failed");
-    const errText = `❌ فشل التشغيل في المكالمة:\n${(err as Error).message}`;
+    const rawMsg = (err as Error).message ?? String(err);
+
+    // Show user-friendly message in group — hide technical details
+    let userMsg = "❌ تعذّر التشغيل في المكالمة، حاول مرة أخرى.";
+    if (rawMsg.includes("no_active_call") || rawMsg.includes("لا يوجد مكالمة")) {
+      userMsg = "❌ لا توجد مكالمة صوتية نشطة في المجموعة.";
+    } else if (rawMsg.includes("timeout")) {
+      userMsg = "❌ انتهت المهلة، حاول مرة أخرى.";
+    }
+
     if (statusMsgId) {
       if (isPhoto) {
-        await api.editMessageCaption(chatId, statusMsgId, { caption: errText }).catch(() => {});
+        await api.editMessageCaption(chatId, statusMsgId, { caption: userMsg }).catch(() => {});
       } else {
-        await api.editMessageText(chatId, statusMsgId, errText).catch(() => {});
+        await api.editMessageText(chatId, statusMsgId, userMsg).catch(() => {});
       }
     } else {
-      await api.sendMessage(chatId, errText).catch(() => {});
+      await api.sendMessage(chatId, userMsg).catch(() => {});
     }
+
+    // Notify owner privately with full technical details
+    if (OWNER_ID) {
+      await bot.api.sendMessage(
+        OWNER_ID,
+        `⚠️ خطأ في التشغيل (chat ${chatId}):\n\`${rawMsg.slice(0, 300)}\``,
+        { parse_mode: "Markdown" },
+      ).catch(() => {});
+    }
+
     if (filePath && existsSync(filePath)) await unlink(filePath).catch(() => {});
   }
 }
@@ -484,7 +503,10 @@ bot.on("message:text", async (ctx) => {
     const query = text.slice(4).trim();
     if (!query) return ctx.reply("⚠️ اكتب اسم الأغنية بعد *شغل*", { parse_mode: "Markdown" });
     if (!voiceManager.isReady()) {
-      return ctx.reply("❌ خدمة المكالمات غير متاحة. تأكد من تسجيل الدخول أولاً.");
+      return ctx.reply("❌ خدمة المكالمات غير متاحة مؤقتاً، انتظر لحظة وحاول مجدداً.");
+    }
+    if (!voiceManager.isSessionActive()) {
+      return ctx.reply("⏳ البوت يقوم بالاتصال بالخادم، انتظر لحظة وحاول مجدداً. إن استمر الخطأ تواصل مع المشرف.");
     }
 
     // Check voice call is active
@@ -767,6 +789,20 @@ export function startBot() {
     for (const [userId, chatId] of pendingQR.entries()) {
       await bot.api.sendMessage(chatId, `❌ خطأ في تسجيل الدخول: ${msg.error}`).catch(() => {});
       pendingQR.delete(userId);
+    }
+  });
+
+  // Session restore failed — notify owner in private chat only
+  voiceManager.on("session_restore_failed", async (msg: { error?: string }) => {
+    logger.error({ error: msg.error }, "Session restore failed");
+    if (OWNER_ID) {
+      await bot.api.sendMessage(
+        OWNER_ID,
+        `⚠️ *انتهت صلاحية جلسة البوت*\n\n` +
+        `السبب: ${msg.error ?? "غير معروف"}\n\n` +
+        `للإصلاح: أرسل /qr هنا في الخاص لتسجيل الدخول مجدداً.`,
+        { parse_mode: "Markdown" },
+      ).catch((e) => logger.error({ e }, "Failed to notify owner of session failure"));
     }
   });
 
