@@ -10,6 +10,14 @@ import { YT_COOKIES_FILE } from "./app";
 
 const execFileAsync = promisify(execFile);
 
+// Short-key URL cache for بحث callbacks (Telegram 64-byte callback limit)
+const urlCache = new Map<string, string>(); // key → full song URL
+function cacheUrl(url: string): string {
+  const key = Math.random().toString(36).slice(2, 9);
+  urlCache.set(key, url);
+  return key;
+}
+
 const BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
@@ -55,11 +63,12 @@ interface PlayInfo {
 }
 
 interface QueueItem {
-  videoId: string;
+  videoId: string;   // now stores full SoundCloud URL
   title: string;
   uploader: string;
   userId: number;
   userName: string;
+  thumbUrl?: string;
 }
 
 const nowPlayingUser = new Map<number, number>();     // chatId -> userId
@@ -138,33 +147,39 @@ async function editNowPlaying(
   }
 }
 
-// ─── YouTube helpers ─────────────────────────────────────────────────────────
+// ─── SoundCloud helpers ───────────────────────────────────────────────────────
 
-type VideoResult = { id: string; title: string; duration: string; uploader: string };
+type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbUrl?: string };
 
 function ytCookiesArgs(): string[] {
   return existsSync(YT_COOKIES_FILE) ? ["--cookies", YT_COOKIES_FILE] : [];
 }
 
-async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
+async function searchSoundCloud(query: string, limit = 5): Promise<VideoResult[]> {
   const { stdout } = await execFileAsync("yt-dlp", [
-    `ytsearch${limit}:${query}`,
-    "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(uploader)s",
+    `scsearch${limit}:${query}`,
+    "--print", "%(webpage_url)s|||%(title)s|||%(duration_string)s|||%(uploader)s|||%(thumbnail)s",
     "--no-download", "--no-playlist", "--socket-timeout", "20", "--quiet",
-    ...ytCookiesArgs(),
   ]);
   return stdout.trim().split("\n")
     .filter(l => l.includes("|||"))
     .map(l => {
       const p = l.split("|||");
-      return { id: p[0].trim(), title: p[1].trim(), duration: p[2].trim(), uploader: p[3].trim() };
-    });
+      return {
+        id: p[0]?.trim() ?? "",        // full SoundCloud URL
+        title: p[1]?.trim() ?? "",
+        duration: p[2]?.trim() ?? "",
+        uploader: p[3]?.trim() ?? "",
+        thumbUrl: p[4]?.trim() || undefined,
+      };
+    })
+    .filter(r => r.id.startsWith("http"));
 }
 
-async function downloadAudio(videoId: string): Promise<string> {
-  const outTemplate = `${tmpdir()}/tg_${videoId}_${Date.now()}.%(ext)s`;
+async function downloadAudio(songUrl: string): Promise<string> {
+  const outTemplate = `${tmpdir()}/tg_audio_${Date.now()}.%(ext)s`;
   await execFileAsync("yt-dlp", [
-    `https://www.youtube.com/watch?v=${videoId}`,
+    songUrl,
     "-x", "--audio-format", "mp3", "--audio-quality", "128K",
     "-o", outTemplate, "--no-playlist", "--socket-timeout", "30", "--quiet",
     ...ytCookiesArgs(),
@@ -176,7 +191,7 @@ async function downloadAudio(videoId: string): Promise<string> {
 
 async function sendAudioFile(
   chatId: number,
-  videoId: string,
+  songUrl: string,
   title: string,
   uploader: string,
   api: Bot["api"],
@@ -184,7 +199,7 @@ async function sendAudioFile(
   const statusMsg = await api.sendMessage(chatId, `⏳ جارٍ تحميل: ${title}`);
   let filePath: string | null = null;
   try {
-    filePath = await downloadAudio(videoId);
+    filePath = await downloadAudio(songUrl);
     if (!existsSync(filePath)) throw new Error("File not found");
     const { createReadStream } = await import("node:fs");
     await api.sendAudio(chatId, new InputFile(createReadStream(filePath), `${title.slice(0, 50)}.mp3`), {
@@ -194,7 +209,7 @@ async function sendAudioFile(
     });
     await api.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
   } catch (err) {
-    logger.error({ err, videoId }, "Download/send failed");
+    logger.error({ err, songUrl }, "Download/send failed");
     await api.editMessageText(chatId, statusMsg.message_id, "❌ فشل التحميل، جرب أغنية ثانية.").catch(() => {});
     if (filePath && existsSync(filePath)) await unlink(filePath).catch(() => {});
   }
@@ -204,32 +219,38 @@ async function sendAudioFile(
 
 async function playInCall(
   chatId: number,
-  videoId: string,
+  songUrl: string,
   title: string,
   uploader: string,
   userId: number,
   api: Bot["api"],
+  thumbUrl?: string,
 ) {
-  const thumbUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
   let statusMsgId: number | undefined;
   let isPhoto = false;
   let filePath: string | null = null;
 
   try {
-    try {
-      const ph = await api.sendPhoto(chatId, thumbUrl, {
-        caption: `⏳ جارٍ التحميل...\n\n🎵 *${title}*\n👤 ${uploader}`,
-        parse_mode: "Markdown",
-      });
-      statusMsgId = ph.message_id;
-      isPhoto = true;
-    } catch {
+    if (thumbUrl) {
+      try {
+        const ph = await api.sendPhoto(chatId, thumbUrl, {
+          caption: `⏳ جارٍ التحميل...\n\n🎵 *${title}*\n👤 ${uploader}`,
+          parse_mode: "Markdown",
+        });
+        statusMsgId = ph.message_id;
+        isPhoto = true;
+      } catch {
+        const msg = await api.sendMessage(chatId, `⏳ جارٍ التحميل...\n🎵 ${title}`);
+        statusMsgId = msg.message_id;
+        isPhoto = false;
+      }
+    } else {
       const msg = await api.sendMessage(chatId, `⏳ جارٍ التحميل...\n🎵 ${title}`);
       statusMsgId = msg.message_id;
       isPhoto = false;
     }
 
-    filePath = await downloadAudio(videoId);
+    filePath = await downloadAudio(songUrl);
     if (!existsSync(filePath)) throw new Error("File not found after download");
 
     const result = await voiceManager.joinAndPlay(chatId, filePath);
@@ -301,7 +322,7 @@ async function playNextFromQueue(chatId: number, api: Bot["api"]) {
     `▶️ الآن من الطابور:\n🎵 *${next.title}*\n👤 طلبها: ${next.userName}`,
     { parse_mode: "Markdown" }
   ).catch(() => {});
-  await playInCall(chatId, next.videoId, next.title, next.uploader, next.userId, api);
+  await playInCall(chatId, next.videoId, next.title, next.uploader, next.userId, api, next.thumbUrl);
 }
 
 // ─── Whitelist middleware ────────────────────────────────────────────────────
@@ -397,7 +418,7 @@ bot.on("message:text", async (ctx) => {
     if (!query) return ctx.reply("⚠️ اكتب اسم الأغنية بعد *يوت*", { parse_mode: "Markdown" });
     await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
-      const results = await searchYouTube(query, 1);
+      const results = await searchSoundCloud(query, 1);
       if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
       await sendAudioFile(chatId, results[0].id, results[0].title, results[0].uploader, ctx.api);
     } catch (err) {
@@ -414,7 +435,7 @@ bot.on("message:text", async (ctx) => {
     if (!query) return ctx.reply("⚠️ اكتب اسم الأغنية بعد *بحث*", { parse_mode: "Markdown" });
     const searchMsg = await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
-      const results = await searchYouTube(query, 5);
+      const results = await searchSoundCloud(query, 5);
       if (!results.length) {
         await ctx.api.editMessageText(chatId, searchMsg.message_id, "❌ ما لقيت نتائج.");
         return;
@@ -422,8 +443,9 @@ bot.on("message:text", async (ctx) => {
       await ctx.api.deleteMessage(chatId, searchMsg.message_id).catch(() => {});
       const keyboard = new InlineKeyboard();
       for (const v of results) {
+        const key = cacheUrl(v.id);
         const label = `${v.title.slice(0, 33)} [${v.duration}]`;
-        keyboard.text(label, `dl:${v.id}:${v.uploader.slice(0, 18)}:${v.title.slice(0, 28)}`).row();
+        keyboard.text(label, `dl:${key}:${v.uploader.slice(0, 18)}:${v.title.slice(0, 28)}`).row();
       }
       await ctx.reply(`🎵 *نتائج:* ${query}\n\nاختر أغنية:`, {
         parse_mode: "Markdown",
@@ -457,17 +479,16 @@ bot.on("message:text", async (ctx) => {
     if (nowPlayingInfo.has(chatId)) {
       await ctx.reply(`🔍 أبحث عن: ${query}`);
       try {
-        const results = await searchYouTube(query, 1);
+        const results = await searchSoundCloud(query, 1);
         if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
         const top = results[0];
         const queue = getQueue(chatId);
-        queue.push({ videoId: top.id, title: top.title, uploader: top.uploader, userId, userName });
+        queue.push({ videoId: top.id, title: top.title, uploader: top.uploader, userId, userName, thumbUrl: top.thumbUrl });
         const pos = queue.length;
         await ctx.reply(
           `📋 تمت الإضافة للطابور (#${pos})\n🎵 *${top.title}*\n👤 ${top.uploader}`,
           { parse_mode: "Markdown" }
         );
-        // Update now-playing message to show queue count
         const info = nowPlayingInfo.get(chatId);
         if (info?.msgId) {
           await editNowPlaying(chatId, info.msgId, info.isPhoto,
@@ -483,10 +504,10 @@ bot.on("message:text", async (ctx) => {
     // Nothing playing → play directly
     await ctx.reply(`🔍 أبحث عن: ${query}`);
     try {
-      const results = await searchYouTube(query, 1);
+      const results = await searchSoundCloud(query, 1);
       if (!results.length) return ctx.reply("❌ ما لقيت نتائج.");
       const top = results[0];
-      await playInCall(chatId, top.id, top.title, top.uploader, userId, ctx.api);
+      await playInCall(chatId, top.id, top.title, top.uploader, userId, ctx.api, top.thumbUrl);
     } catch (err) {
       logger.error({ err }, "شغل error");
       await ctx.reply("❌ صار خطأ.");
@@ -534,10 +555,14 @@ bot.on("message:text", async (ctx) => {
 
 bot.callbackQuery(/^dl:([^:]+):([^:]+):(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery({ text: "⏳ جارٍ التحميل..." });
-  const [, videoId, uploader, title] = ctx.match;
+  const [, cacheKey, uploader, title] = ctx.match;
   const chatId = ctx.chat?.id;
   if (!chatId) return;
-  await sendAudioFile(chatId, videoId, title, uploader, ctx.api);
+  const songUrl = urlCache.get(cacheKey);
+  if (!songUrl) {
+    return ctx.reply("❌ انتهت صلاحية هذا الاختيار، أعد البحث.");
+  }
+  await sendAudioFile(chatId, songUrl, title, uploader, ctx.api);
 });
 
 // ─── Callback: Stop voice call ────────────────────────────────────────────────
